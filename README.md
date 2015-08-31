@@ -1,7 +1,7 @@
-Angr
+angr
 ====
 
-Angr is a platform-agnostic binary analysis framework developed by the Computer Security Lab at UC Santa Barbara and their associated CTF team, Shellphish.
+angr is a platform-agnostic binary analysis framework developed by the Computer Security Lab at UC Santa Barbara and their associated CTF team, Shellphish.
 
 For information about how to use angr, consult the
 [angr-doc](https://github.com/angr/angr-doc) repository.
@@ -46,9 +46,10 @@ To utilize this, perform the following:
 
 ```bash
 mkvirtualenv angr
-mkdir angr; cd angr
+mkdir ~/angr; cd ~/angr
 
 git clone https://github.com/angr/angr
+git clone https://github.com/angr/angr-management
 git clone https://github.com/angr/simuvex
 git clone https://github.com/angr/claripy
 git clone https://github.com/angr/cle
@@ -58,18 +59,20 @@ git clone https://github.com/angr/archinfo
 git clone https://github.com/zardus/ana
 git clone https://github.com/zardus/cooldict
 
-pip install -e ./cooldict
-pip install -e ./ana
-pip install -e ./archinfo
-pip install -e ./pyvex
-pip install -e ./cle
-pip install -e ./claripy
-pip install -e ./simuvex
-pip install -e ./angr
+pip install -e ./cooldict -e ./ana -e ./archinfo -e ./pyvex -e ./cle -e ./claripy -e ./simuvex -e ./angr -e ./angr-management
 ```
 
+This will create a `~/angr` directory, into which all of the angr sub-components will be checked out.
+You can then branch/edit/recompile the various modules in-place, and it will automatically reflect in your virtual environment.
 
 # Troubleshooting
+
+## libgomp.so.1: version `GOMP_4.0' not found
+This error represents an incompatibility between the pre-compiled version of `angr-z3` and the installed version of `libgomp`. A Z3 recompile is required. You can do this by executing:
+
+```bash
+pip install -I --no-use-wheel angr-z3
+```
 
 ## Can't import mulpyplexer
 There are sometimes issues with installing mulpyplexer. Doing `pip install --upgrade 'git+https://github.com/zardus/mulpyplexer'` should fix this.

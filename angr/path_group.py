@@ -71,13 +71,14 @@ class PathGroup(ana.Storable):
         } if stashes is None else stashes
 
     @classmethod
-    def call(cls, project, target, args=(), start=None, **kwargs):
+    def call(cls, project, target, args=(), start=None, prototype=None, **kwargs): #pylint:disable=unused-argument
         """"Calls" a function in the binary, returning a PathGroup with the call set up.
 
         :param project: :class:`angr.Project` instance
         :param target: address of function to call
         :param args: arguments to call the function with
-        :param start: path (or paths) to start the call with
+        :param start: Optional: path (or paths) to start the call with
+        :param prototype: Optional: A SimTypeFunction to typecheck arguments against
         :param **kwargs: other kwargs to pass to construct :class:`PathGroup`
         :return: a :class:`PathGroup` calling the function
         """
@@ -143,8 +144,9 @@ class PathGroup(ana.Storable):
     # Util functions
     #
 
-    def copy(self):
-        return PathGroup(self._project, stashes=self._copy_stashes(immutable=True), hierarchy=self._hierarchy, immutable=self._immutable)
+    def copy(self, stashes=None):
+        stashes = stashes if stashes is not None else self._copy_stashes(immutable=True)
+        return PathGroup(self._project, stashes=stashes, hierarchy=self._hierarchy, immutable=self._immutable, veritesting=self._veritesting, veritesting_options=self._veritesting_options, resilience=self._resilience, save_unconstrained=self.save_unconstrained, save_unsat=self.save_unsat)
 
     def _copy_stashes(self, immutable=None):
         '''
@@ -180,7 +182,7 @@ class PathGroup(ana.Storable):
             self.stashes = new_stashes
             return self
         else:
-            return PathGroup(self._project, stashes=new_stashes, hierarchy=self._hierarchy, immutable=self._immutable)
+            return self.copy(stashes=new_stashes)
 
     @staticmethod
     def _condition_to_lambda(condition, default=False):
@@ -286,10 +288,11 @@ class PathGroup(ana.Storable):
 
                     if (check_func is not None and check_func(a)) or (check_func is None and a.errored):
                         # This path has error(s)!
-                        if isinstance(a.error, PathUnreachableError):
+                        if hasattr(a, "error") and isinstance(a.error, PathUnreachableError):
                             new_stashes['pruned'].append(a)
                         else:
-                            self._hierarchy.unreachable(a)
+                            if self._hierarchy:
+                                self._hierarchy.unreachable(a)
                             new_stashes['errored'].append(a)
                         has_stashed = True
                     else:
@@ -306,7 +309,8 @@ class PathGroup(ana.Storable):
                                     new_stashes['unsat'] = [ ]
                                 new_stashes['unsat'] += a.unsat_successors
 
-                self._hierarchy.add_successors(a, successors)
+                if self._hierarchy:
+                    self._hierarchy.add_successors(a, successors)
                 if not has_stashed:
                     if len(successors) == 0:
                         new_stashes['deadended'].append(a)
@@ -537,7 +541,8 @@ class PathGroup(ana.Storable):
                 if to_stash not in new_stashes:
                     new_stashes[to_stash] = [ ]
                 new_stashes[to_stash].append(p)
-                self._hierarchy.unreachable(p)
+                if self._hierarchy:
+                    self._hierarchy.unreachable(p)
             else:
                 new_active.append(p)
 
@@ -625,9 +630,10 @@ class PathGroup(ana.Storable):
         merge_groups = [ ]
         while len(to_merge) > 0:
             g, to_merge = self._filter_paths(lambda p: p.addr == to_merge[0].addr, to_merge)
-            if len(g) == 1:
-                not_to_merge.append(g)
-            merge_groups.append(g)
+            if len(g) <= 1:
+                not_to_merge.extend(g)
+            else:
+                merge_groups.append(g)
 
         for g in merge_groups:
             try:
@@ -726,7 +732,8 @@ class PathGroup(ana.Storable):
         cur_found = len(self.stashes[found_stash]) if found_stash in self.stashes else 0
 
         explore_step_func = lambda pg: pg.stash(find, from_stash=stash, to_stash=found_stash) \
-                                         .stash(avoid, from_stash=stash, to_stash=avoid_stash)
+                                         .stash(avoid, from_stash=stash, to_stash=avoid_stash) \
+                                         .prune(from_stash=found_stash)
         until_func = lambda pg: len(pg.stashes[found_stash]) >= cur_found + num_find
         return self.step(n=n, step_func=explore_step_func, until=until_func, stash=stash)
 

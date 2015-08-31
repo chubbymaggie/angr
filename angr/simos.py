@@ -381,11 +381,11 @@ class SimCGC(SimOS):
 class IFuncResolver(SimProcedure):
     # pylint: disable=arguments-differ,unused-argument
     def run(self, proj=None, funcaddr=None, gotaddr=None, funcname=None):
-        resolve = Callable(proj, funcaddr, SimTypeFunction((), SimTypePointer(self.state.arch, SimTypeTop())))
+        resolve = proj.factory.callable(funcaddr, concrete_only=True)
         try:
             value = resolve()
         except AngrCallableError:
-            l.critical("Ifunc failed to resolve!")
+            l.critical("Ifunc \"%s\" failed to resolve!", funcname)
             #import IPython; IPython.embed()
             raise
         self.state.memory.store(gotaddr, value, endness=self.state.arch.memory_endness)

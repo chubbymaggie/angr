@@ -4,9 +4,9 @@ import logging
 import networkx
 import simuvex
 import claripy
+import angr
 
 from ..entry_wrapper import EntryWrapper, CallStack
-from .cfg_base import CFGBase
 from ..analysis import Analysis
 from ..errors import AngrVFGError, AngrVFGRestartAnalysisNotice, AngrError
 
@@ -273,7 +273,7 @@ class VFG(Analysis):
         tracing_times = defaultdict(int)
 
         # For each call, we are always getting two exits: an Ijk_Call that
-        # stands for the real call exit, and an Ijk_Ret that is a simulated exit
+        # stands for the real call exit, and an Ijk_FakeRet which is a simulated exit
         # for the retn address. There are certain cases that the control flow
         # never returns to the next instruction of a callsite due to
         # imprecision of the concrete execution. So we save those simulated
@@ -581,7 +581,7 @@ class VFG(Analysis):
 
         # If this is a call exit, we shouldn't put the default exit (which
         # is artificial) into the CFG. The exits will be Ijk_Call and
-        # Ijk_Ret, and Ijk_Call always goes first
+        # Ijk_FakeRet, and Ijk_Call always goes first
         is_call_jump = any([ self._is_call_jump(i.scratch.jumpkind) for i in all_successors ])
         call_targets = [ i.se.exactly_int(i.ip) for i in all_successors if self._is_call_jump(i.scratch.jumpkind) ]
         call_target = None if not call_targets else call_targets[0]
@@ -607,7 +607,7 @@ class VFG(Analysis):
         l.debug("(Function %s of binary %s)", function_name, module_name)
         l.debug("|    Has simulated retn: %s", is_call_jump)
         for suc_state in all_successors:
-            if is_call_jump and suc_state.scratch.jumpkind == "Ijk_Ret":
+            if is_call_jump and suc_state.scratch.jumpkind == "Ijk_FakeRet":
                 exit_type_str = "Simulated Ret"
             else:
                 exit_type_str = "-"
@@ -773,7 +773,7 @@ class VFG(Analysis):
             # Check if that function is returning
             if self._cfg is not None:
                 func = self._cfg.function_manager.function(call_target)
-                if func is not None and not func.has_return and len(all_successors) == 2:
+                if func is not None and func.returning is False and len(all_successors) == 2:
                     # Remove the fake return as it is not returning anyway...
                     del all_successors[-1]
                     fakeret_successor = None
@@ -808,7 +808,7 @@ class VFG(Analysis):
             if new_tpl in pending_returns:
                 del pending_returns[new_tpl]
 
-        if jumpkind == "Ijk_Ret" and is_call_jump:
+        if jumpkind == "Ijk_FakeRet" and is_call_jump:
             # This is the default "fake" return successor generated at each
             # call. Save them first, but don't process them right
             # away
@@ -849,10 +849,14 @@ class VFG(Analysis):
                     # Remove the existing stack address mapping
                     # FIXME: Now we are assuming the sp is restored to its original value
                     reg_sp_offset = successor_path.state.arch.sp_offset
-                    reg_sp_expr = successor_path.state.registers.load(reg_sp_offset).model
+                    reg_sp_expr = successor_path.state.registers.load(reg_sp_offset)
 
-                    reg_sp_si = reg_sp_expr.items()[0][1]
-                    reg_sp_val = reg_sp_si.min
+                    if isinstance(reg_sp_expr.model, claripy.vsa.StridedInterval):
+                        reg_sp_si = reg_sp_expr.model
+                        reg_sp_val = reg_sp_si.min
+                    elif isinstance(reg_sp_expr.model, claripy.vsa.ValueSet):
+                        reg_sp_si = reg_sp_expr.model.items()[0][1]
+                        reg_sp_val = reg_sp_si.min
                     # TODO: Finish it!
 
             new_exit_wrapper = EntryWrapper(successor_path,
@@ -863,7 +867,7 @@ class VFG(Analysis):
             r = self._append_to_remaining_entries(remaining_entries, new_exit_wrapper)
             _dbg_exit_status[suc_state] = r
 
-        if not is_call_jump or jumpkind != "Ijk_Ret":
+        if not is_call_jump or jumpkind != "Ijk_FakeRet":
             exit_targets[call_stack_suffix + (addr,)].append((new_tpl, jumpkind))
         else:
             # This is the fake return!
@@ -909,6 +913,8 @@ class VFG(Analysis):
         # print old_state.dbg_print_stack()
         # print new_state.dbg_print_stack()
 
+        l.debug('Widening state at IP %s', old_state.ip)
+
         if old_state.scratch.ignored_variables is None:
             old_state.scratch.ignored_variables = new_state.scratch.ignored_variables
 
@@ -928,6 +934,8 @@ class VFG(Analysis):
         :param previously_widened_state:
         :return: The narrowed state, and whether a narrowing has occurred
         """
+
+        l.debug('Narrowing state at IP %s', previously_widened_state.ip)
 
         s = previously_widened_state.copy()
 
@@ -977,6 +985,9 @@ class VFG(Analysis):
             reg_sp_val = reg_sp_expr.model
             reg_sp_si = successor_state.se.SI(bits=successor_state.arch.bits, to_conv=reg_sp_val)
             reg_sp_si = reg_sp_si.model
+        elif type(reg_sp_expr.model) is claripy.vsa.StridedInterval:
+            reg_sp_si = reg_sp_expr.model
+            reg_sp_val = reg_sp_si.min
         else:
             reg_sp_si = reg_sp_expr.model.items()[0][1]
             reg_sp_val = reg_sp_si.min
@@ -1149,3 +1160,49 @@ class VFG(Analysis):
             return b.addr
         else:
             raise Exception("Unsupported block type %s" % type(b))
+
+    def get_any_node(self, addr):
+        """
+        Get any VFG node corresponding to the basic block at @addr.
+        Note that depending on the context sensitivity level, there might be
+        multiple nodes corresponding to different contexts. This function will
+        return the first one it encounters, which might not be what you want.
+        """
+        for n in self._graph.nodes():
+            if n.addr == addr:
+                return n
+
+    def irsb_from_node(self, node):
+        return self._p.factory.sim_run(node.state, addr=node.addr)
+
+    def _get_nx_paths(self, begin, end):
+        """
+        Get the possible (networkx) simple paths between two nodes or addresses
+        corresponding to nodes.
+        Input: addresses or node instances
+        Return: a list of lists of nodes representing paths.
+        """
+        if isinstance(begin, int) and isinstance(end, int):
+            n_begin = self.get_any_node(begin)
+            n_end = self.get_any_node(end)
+
+        elif isinstance(begin, VFGNode) and isinstance(end, VFGNode):
+            n_begin = begin
+            n_end = end
+        else:
+            raise AngrVFGError("from and to should be of the same type")
+
+        return networkx.all_simple_paths(self._graph, n_begin, n_end)
+
+    def get_paths(self, begin, end):
+        """
+        Get all the simple paths between @begin and @end.
+        Returns: a list of angr.Path instances.
+        """
+        paths = self._get_nx_paths(begin, end)
+        a_paths = []
+        for p in paths:
+            runs = map(self.irsb_from_node, p)
+            a_paths.append(angr.path.make_path(self._project, runs))
+            return a_paths
+

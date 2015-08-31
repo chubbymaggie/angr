@@ -38,6 +38,11 @@ class CFGNode(object):
         self.syscall = syscall
         self._cfg = cfg
         self.function_address = function_address
+        self.name = simprocedure_name or cfg._project.loader.find_symbol_name(addr)
+        if function_address and self.name is None:
+            self.name = cfg._project.loader.find_symbol_name(function_address)
+            if self.name is not None:
+                self.name = "%s+0x%x" % (self.name, (addr - function_address))
 
         # If this CFG contains an Ijk_Call, `return_target` stores the returning site.
         # Note: this is regardless of whether the call returns or not. You should always check the `no_ret` property if
@@ -80,8 +85,8 @@ class CFGNode(object):
         return c
 
     def __repr__(self):
-        if self.simprocedure_name is not None:
-            s = "<CFGNode %s (0x%x) [%d]>" % (self.simprocedure_name, self.addr, self.looping_times)
+        if self.name is not None:
+            s = "<CFGNode %s (0x%x) [%d]>" % (self.name, self.addr, self.looping_times)
         else:
             s = "<CFGNode 0x%x (%d) [%d]>" % (self.addr, self.size, self.looping_times)
 
@@ -2288,7 +2293,7 @@ class CFG(Analysis, CFGBase):
                 if endpoint in func.blocks:
                     # Somehow analysis terminated here (e.g. an unsupported instruction, or it doesn't generate an exit)
 
-                    n = self.get_any_node(endpoint)
+                    n = self.get_any_node(endpoint, is_syscall=func.is_syscall)
                     if n:
                         # It might be a SimProcedure or a syscall, or even a normal block
                         all_endpoints_returning.append(not n.no_ret)
@@ -2528,3 +2533,35 @@ class CFG(Analysis, CFGBase):
         s['_thumb_addrs'] = self._thumb_addrs
 
         return s
+
+    def _get_nx_paths(self, begin, end):
+        """
+        Get the possible (networkx) simple paths between two nodes or addresses
+        corresponding to nodes.
+        Input: addresses or node instances
+        Return: a list of lists of nodes representing paths.
+        """
+        if isinstance(begin, int) and isinstance(end, int):
+            n_begin = self.get_any_node(begin)
+            n_end = self.get_any_node(end)
+
+        elif isinstance(begin, CFGNode) and isinstance(end, CFGNode):
+            n_begin = begin
+            n_end = end
+        else:
+            raise AngrCFGError("from and to should be of the same type")
+
+        return networkx.all_simple_paths(self.graph, n_begin, n_end)
+
+    def get_paths(self, begin, end):
+        """
+        Get all the simple paths between @begin and @end.
+        Returns: a list of angr.Path instances.
+        """
+        paths = self._get_nx_paths(begin, end)
+        a_paths = []
+        for p in paths:
+            runs = map(self.irsb_from_node, p)
+            a_paths.append(angr.path.make_path(self._project, runs))
+        return a_paths
+
