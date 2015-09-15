@@ -36,6 +36,14 @@ class VFGNode(object):
     def __hash__(self):
         return hash(self.key)
 
+    def __eq__(self, o):
+        return type(self) == type(o) and \
+               self.key == o.key and self.addr == o.addr and \
+               self.state == o.state and self.actions == o.actions and \
+               self.events == o.events and self.narrowing_times == o.narrowing_times and \
+               self.all_states == o.all_states and self.widened_state == o.widened_state and \
+               self.input_variables == o.input_variables
+
     def __repr__(self):
         s = "VFGNode[0x%x] <%s>" % (self.addr, ", ".join([ (("0x%x" % k) if k else "None") for k in self.key ]))
         return s
@@ -59,7 +67,14 @@ class VFG(Analysis):
     This class represents a control-flow graph with static analysis result.
     '''
 
-    def __init__(self, cfg=None, context_sensitivity_level=2, function_start=None, interfunction_level=0, initial_state=None, avoid_runs=None):
+    def __init__(self, cfg=None,
+                 context_sensitivity_level=2,
+                 function_start=None,
+                 interfunction_level=0,
+                 initial_state=None,
+                 avoid_runs=None,
+                 remove_options=None
+                 ):
         '''
         :param project: The project object.
         :param context_sensitivity_level: The level of context-sensitivity of this VFG.
@@ -68,7 +83,7 @@ class VFG(Analysis):
         :param interfunction_level: The level of interfunction-ness to be
         :param initial_state: A state to use as the initial one
         :param avoid_runs: A list of runs to avoid
-        :return:
+        :param remove_options: State options to remove from the initial state. It only works when `initial_state` is None
         '''
 
         # Related CFG.
@@ -82,6 +97,7 @@ class VFG(Analysis):
         self._avoid_runs = [ ] if avoid_runs is None else avoid_runs
         self._context_sensitivity_level = context_sensitivity_level
         self._interfunction_level = interfunction_level
+        self._state_options_to_remove = set() if remove_options is None else remove_options
 
         # Containers
         self._graph = None # TODO: Maybe we want to remove this line?
@@ -120,6 +136,26 @@ class VFG(Analysis):
         new_vfg._edge_map = self._edge_map.copy()
         return new_vfg
 
+    def __setstate__(self, s):
+        self.__dict__.update(s)
+        for n in self._nodes.values():
+            n.state.uninitialized_access_handler = self._uninitialized_access_handler
+            for state in n.final_states:
+                state.uninitialized_access_handler = self._uninitialized_access_handler
+        for a in self._function_initial_states.values():
+            for state in a.values():
+                state.uninitialized_access_handler = self._uninitialized_access_handler
+
+    def __getstate__(self):
+        for n in self._nodes.values():
+            n.state.uninitialized_access_handler = None
+            for state in n.final_states:
+                state.uninitialized_access_handler = None
+        for a in self._function_initial_states.values():
+            for state in a.values():
+                state.uninitialized_access_handler = None
+        return dict(self.__dict__)
+
     def _prepare_state(self, function_start, initial_state, function_key):
         # Crawl the binary, create CFG and fill all the refs inside project!
         if initial_state is None:
@@ -127,7 +163,8 @@ class VFG(Analysis):
                 # We have never saved any initial states for this function
                 # Gotta create a fresh state for it
                 s = self._project.factory.blank_state(mode="static",
-                                              add_options={ simuvex.o.FRESHNESS_ANALYSIS }
+                                              add_options={ simuvex.o.FRESHNESS_ANALYSIS },
+                                              remove_options=self._state_options_to_remove,
                 )
 
                 if function_start != self._project.loader.main_bin.entry:

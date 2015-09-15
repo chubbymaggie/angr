@@ -264,7 +264,7 @@ class BackwardSlice(Analysis):
             raise AngrBackwardSlicingError('Target CFGNode %s is not in the CFG.', cfg_node)
 
         taints = set()
-        tainted_taints = set()
+        accessed_taints = set()
 
         if stmt_id == -1:
             new_taints = self._handle_control_dependence(cfg_node)
@@ -275,7 +275,6 @@ class BackwardSlice(Analysis):
             taints.add(cl)
 
         while taints:
-
             # Pop a tainted code location
             tainted_cl = taints.pop()
 
@@ -283,25 +282,30 @@ class BackwardSlice(Analysis):
             self._pick_statement(tainted_cl.simrun_addr, tainted_cl.stmt_idx)
 
             # Mark it as accessed
-            tainted_taints.add(tainted_cl)
+            accessed_taints.add(tainted_cl)
 
             # Pick all its data dependencies from data dependency graph
             if tainted_cl in self._ddg:
                 predecessors = self._ddg.get_predecessors(tainted_cl)
 
                 for p in predecessors:
-                    if p not in tainted_taints:
+                    if p not in accessed_taints:
                         taints.add(p)
 
             # Handle the control dependence
-            self._handle_control_dependence(cfg_node)
+            for n in self._cfg.get_all_nodes(tainted_cl.simrun_addr):
+                new_taints = self._handle_control_dependence(n)
+
+                for taint in new_taints:
+                    if taint not in accessed_taints:
+                        taints.add(taint)
 
         # In the end, map the taint graph onto CFG
         self._map_to_cfg()
 
     def _find_exits(self, src_block, target_block):
         """
-        Source block has more than one exit, and through some of those exits, the control flow  can eventually go to
+        Source block has more than one exit, and through some of those exits, the control flow can eventually go to
         the target block. This method returns exits that lead to the target block.
 
         :param src_block: The block that has multiple exits
@@ -413,15 +417,19 @@ class BackwardSlice(Analysis):
         while len(exit_statements_per_run):
             for block_address, exits in exit_statements_per_run.iteritems():
                 for stmt_idx, exit_target in exits:
-                    if exit_target not in self._statements_per_run:
+                    if exit_target not in self._exit_statements_per_run:
                         # Oh we found one!
                         # The default exit should be taken no matter where it leads to
                         # Add it to the new set
-                        new_exit_statements_per_run[exit_target].append(('default', None))
+                        tpl = ('default', None)
+                        if tpl not in new_exit_statements_per_run[exit_target]:
+                            new_exit_statements_per_run[exit_target].append(tpl)
 
             # Add the new ones to our global dict
-            for block_address, exits in new_exit_statements_per_run:
-                self._exit_statements_per_run[block_address].append(exits)
+            for block_address, exits in new_exit_statements_per_run.iteritems():
+                for ex in exits:
+                    if ex not in self._exit_statements_per_run[block_address]:
+                        self._exit_statements_per_run[block_address].append(ex)
 
             # Switch them so we can process the new set
             exit_statements_per_run = new_exit_statements_per_run
