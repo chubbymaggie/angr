@@ -6,7 +6,7 @@ import networkx
 from simuvex import SimRegisterVariable, SimMemoryVariable
 
 from ..errors import AngrDDGError
-from ..analysis import Analysis
+from ..analysis import Analysis, register_analysis
 from .code_location import CodeLocation
 
 l = logging.getLogger(name="angr.analyses.vsa_ddg")
@@ -62,7 +62,7 @@ class VSA_DDG(Analysis):
         if vfg is not None:
             self._vfg = vfg
         else:
-            self._vfg = self._p.analyses.VFG(function_start=start_addr,
+            self._vfg = self.project.analyses.VFG(function_start=start_addr,
                                              interfunction_level=interfunction_level,
                                              context_sensitivity_level=context_sensitivity_level)
 
@@ -116,7 +116,7 @@ class VSA_DDG(Analysis):
 
         # The worklist holds individual VFGNodes that comes from the VFG
         # Initialize the worklist with all nodes in VFG
-        worklist = list(self._vfg._graph.nodes_iter())
+        worklist = list(self._vfg.graph.nodes_iter())
         # Set up a set of worklist for fast inclusion test
         worklist_set = set(worklist)
 
@@ -140,7 +140,7 @@ class VSA_DDG(Analysis):
                 live_defs = { }
                 live_defs_per_node[node] = live_defs
 
-            successing_nodes = self._vfg._graph.successors(node)
+            successing_nodes = self._vfg.graph.successors(node)
             for state in final_states:
                 if state.scratch.jumpkind == 'Ijk_FakeRet' and len(final_states) > 1:
                     # Skip fakerets if there are other control flow transitions available
@@ -178,7 +178,7 @@ class VSA_DDG(Analysis):
                     if successing_node not in worklist_set:
                         worklist.append(successing_node)
                         worklist_set.add(successing_node)
-                    all_successors_dict = networkx.dfs_successors(self._vfg._graph, source=successing_node)
+                    all_successors_dict = networkx.dfs_successors(self._vfg.graph, source=successing_node)
                     for successors in all_successors_dict.values():
                         for s in successors:
                             if s not in worklist_set:
@@ -407,3 +407,5 @@ class VSA_DDG(Analysis):
             self.graph.add_edge(s_a, s_b, **edge_labels)
             self._new = True
             l.info("New edge: %s --> %s", s_a, s_b)
+
+register_analysis(VSA_DDG, 'VSA_DDG')
