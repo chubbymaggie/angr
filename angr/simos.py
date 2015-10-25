@@ -9,9 +9,8 @@ from archinfo import ArchARM, ArchMIPS32, ArchX86, ArchAMD64
 from simuvex import SimState, SimIRSB, SimStateSystem, SimActionData
 from simuvex import s_options as o
 from simuvex.s_procedure import SimProcedure, SimProcedureContinuation
-from cle.metaelf import MetaELF
-from cle.backedcgc import BackedCGC
-
+from cle import MetaELF, BackedCGC
+import pyvex
 
 class SimOS(object):
     """A class describing OS/arch-level configuration"""
@@ -384,6 +383,8 @@ class SimCGC(SimOS):
 #
 
 class IFuncResolver(SimProcedure):
+    NO_RET = True
+
     # pylint: disable=arguments-differ,unused-argument
     def run(self, proj=None, funcaddr=None, gotaddr=None, funcname=None):
         resolve = proj.factory.callable(funcaddr, concrete_only=True)
@@ -400,6 +401,8 @@ class IFuncResolver(SimProcedure):
         return '<IFuncResolver %s>' % self.kwargs.get('funcname', None)
 
 class LinuxLoader(SimProcedure):
+    NO_RET = True
+
     # pylint: disable=unused-argument,arguments-differ,attribute-defined-outside-init
     local_vars = ('initializers',)
     def run(self, project=None):
@@ -432,20 +435,22 @@ class _dl_rtld_lock_recursive(SimProcedure):
     def run(self, lock):
         # For future reference:
         # ++((pthread_mutex_t *)(lock))->__data.__count;
-        self.ret()
+        return
 
 class _dl_rtld_unlock_recursive(SimProcedure):
     def run(self):
-        self.ret()
+        return
 
 class _vsyscall(SimProcedure):
+    NO_RET = True
+
     # This is pretty much entirely copied from SimProcedure.ret
     def run(self):
         if self.cleanup:
             self.state.options.discard(o.AST_DEPS)
             self.state.options.discard(o.AUTO_REFS)
 
-        ret_irsb = self.state.arch.disassemble_vex(self.state.arch.ret_instruction, mem_addr=self.addr)
+        ret_irsb = pyvex.IRSB(arch=self.state.arch, bytes=self.state.arch.ret_instruction, mem_addr=self.addr)
         ret_simirsb = SimIRSB(self.state, ret_irsb, inline=True, addr=self.addr)
         if not ret_simirsb.flat_successors + ret_simirsb.unsat_successors:
             ret_state = ret_simirsb.default_exit
@@ -462,7 +467,7 @@ class _kernel_user_helper_get_tls(SimProcedure):
     # pylint: disable=arguments-differ
     def run(self, ld=None):
         self.state.regs.r0 = ld.tls_object.thread_pointer
-        self.ret()
+        return
 
 os_mapping = {
     'unix': SimLinux,
