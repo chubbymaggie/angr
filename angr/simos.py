@@ -20,12 +20,26 @@ class SimOS(object):
         self.proj = project
         self.continue_addr = None
 
-        self.configure_project()
-
     def configure_project(self):
         """Configure the project to set up global settings (like SimProcedures)"""
         self.continue_addr = self.proj._extern_obj.get_pseudo_addr('angr##simproc_continue')
         self.proj.hook(self.continue_addr, SimProcedureContinuation)
+
+        def irelative_resolver(resolver_addr):
+            resolver = self.proj.factory.callable(resolver_addr, concrete_only=True)
+            try:
+                val = resolver()
+            except AngrCallableError:
+                l.error("Resolver at %#x failed to resolve!", resolver_addr)
+                return None
+
+            if not val.singlevalued:
+                l.error("Resolver at %#x failed to resolve! (multivalued)", resolver_addr)
+                return None
+
+            return val._model_concrete.value
+
+        self.proj.loader.perform_irelative_relocs(irelative_resolver)
 
     def state_blank(self, addr=None, initial_prefix=None, **kwargs):
         if kwargs.get('mode', None) is None:
@@ -207,7 +221,7 @@ class SimLinux(SimOS):
             env = {}
 
         # Prepare argc
-        argc = state.BVV(len(args), state.arch.bits)
+        argc = state.se.BVV(len(args), state.arch.bits)
         if sargc is not None:
             argc = state.se.Unconstrained("argc", state.arch.bits)
 
@@ -234,7 +248,7 @@ class SimLinux(SimOS):
         table.add_null()
 
         # Dump the table onto the stack, calculate pointers to args, env, and auxv
-        state.memory.store(state.regs.sp, state.BVV(0, 8*16), endness='Iend_BE')
+        state.memory.store(state.regs.sp, state.se.BVV(0, 8*16), endness='Iend_BE')
         argv = table.dump(state, state.regs.sp)
         envp = argv + ((len(args) + 1) * state.arch.bytes)
         auxv = argv + ((len(args) + len(env) + 2) * state.arch.bytes)
@@ -245,10 +259,10 @@ class SimLinux(SimOS):
         state.regs.sp = newsp
 
         if state.arch.name in ('PPC32',):
-            state.stack_push(state.BVV(0, 32))
-            state.stack_push(state.BVV(0, 32))
-            state.stack_push(state.BVV(0, 32))
-            state.stack_push(state.BVV(0, 32))
+            state.stack_push(state.se.BVV(0, 32))
+            state.stack_push(state.se.BVV(0, 32))
+            state.stack_push(state.se.BVV(0, 32))
+            state.stack_push(state.se.BVV(0, 32))
 
         # store argc argv envp auxv in the posix plugin
         state.posix.argv = argv
@@ -275,7 +289,7 @@ class SimLinux(SimOS):
                 elif val == 'ld_destructor':
                     # a pointer to the dynamic linker's destructor routine, to be called at exit
                     # or NULL. We like NULL. It makes things easier.
-                    state.registers.store(reg, state.BVV(0, state.arch.bits))
+                    state.registers.store(reg, state.se.BVV(0, state.arch.bits))
                 elif val == 'toc':
                     if self.proj.loader.main_bin.is_ppc64_abiv1:
                         state.registers.store(reg, self.proj.loader.main_bin.ppc64_initial_rtoc)
@@ -290,16 +304,28 @@ class SimLinux(SimOS):
 
 class SimCGC(SimOS):
     def state_blank(self, fs=None, **kwargs):
+
+        # Set CGC-specific options
+        # In this way those options can still be removed by "remove_options" argument
+        all_options = set()
+        if 'options' in kwargs:
+            all_options |= kwargs['options']
+        if 'add_options' in kwargs:
+            all_options |= kwargs['add_options']
+        if (o.CGC_ZERO_FILL_UNCONSTRAINED_MEMORY not in all_options):
+            # s.options.add(o.CGC_NO_SYMBOLIC_RECEIVE_LENGTH)
+            kwargs['add_options'] = kwargs['add_options'] if 'add_options' in kwargs else set()
+            kwargs['add_options'].add(o.CGC_ZERO_FILL_UNCONSTRAINED_MEMORY)
+
         s = super(SimCGC, self).state_blank(**kwargs)  # pylint:disable=invalid-name
+
+        # Special stack base for CGC binaries to work with Shellphish CRS
+        s.regs.sp = 0xbaff0000
 
         s.register_plugin('posix', SimStateSystem(fs=fs))
 
         # Create the CGC plugin
         s.get_plugin('cgc')
-
-        # Set CGC-specific options
-        #s.options.add(o.CGC_NO_SYMBOLIC_RECEIVE_LENGTH)
-        s.options.add(o.CGC_ZERO_FILL_UNCONSTRAINED_MEMORY)
 
         return s
 
@@ -318,7 +344,7 @@ class SimCGC(SimOS):
                     state.regs.fc3210 = (val & 0x4700)
                 elif reg == 'ftag':
                     empty_bools = [((val >> (x*2)) & 3) == 3 for x in xrange(8)]
-                    tag_chars = [state.BVV(0 if x else 1, 8) for x in empty_bools]
+                    tag_chars = [state.se.BVV(0 if x else 1, 8) for x in empty_bools]
                     for i, tag in enumerate(tag_chars):
                         setattr(state.regs, 'fpu_t%d' % i, tag)
                 elif reg in ('fiseg', 'fioff', 'foseg', 'fooff', 'fop'):
@@ -335,7 +361,7 @@ class SimCGC(SimOS):
                 if size == 0:
                     continue
                 str_to_write = state.posix.files[1].content.load(state.posix.files[1].pos, size)
-                a = SimActionData(state, 'file_1_0', 'write', addr=state.BVV(state.posix.files[1].pos, state.arch.bits), data=str_to_write, size=size)
+                a = SimActionData(state, 'file_1_0', 'write', addr=state.se.BVV(state.posix.files[1].pos, state.arch.bits), data=str_to_write, size=size)
                 state.posix.write(stdout, str_to_write, size)
                 state.log.add_action(a)
 
@@ -349,7 +375,7 @@ class SimCGC(SimOS):
             state.regs.esi = 0
             state.regs.esp = 0xbaaaaffc
             state.regs.ebp = 0
-            #state.regs.eflags = s.BVV(0x202, 32)
+            #state.regs.eflags = s.se.BVV(0x202, 32)
 
             # fpu values
             state.regs.mm0 = 0
@@ -420,9 +446,9 @@ class LinuxLoader(SimProcedure):
 class _tls_get_addr(SimProcedure):
     # pylint: disable=arguments-differ
     def run(self, ptr, ld=None):
-        module_id = self.state.memory.load(ptr, self.state.arch.bytes, endness=self.state.arch.memory_endness).model.value
-        offset = self.state.memory.load(ptr+self.state.arch.bytes, self.state.arch.bytes, endness=self.state.arch.memory_endness).model.value
-        return self.state.BVV(ld.tls_object.get_addr(module_id, offset), self.state.arch.bits)
+        module_id = self.state.se.any_int(self.state.memory.load(ptr, self.state.arch.bytes, endness=self.state.arch.memory_endness))
+        offset = self.state.se.any_int(self.state.memory.load(ptr+self.state.arch.bytes, self.state.arch.bytes, endness=self.state.arch.memory_endness))
+        return self.state.se.BVV(ld.tls_object.get_addr(module_id, offset), self.state.arch.bits)
 
 class _tls_get_addr_tunder_x86(SimProcedure):
     # pylint: disable=arguments-differ

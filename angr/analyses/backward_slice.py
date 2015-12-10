@@ -12,12 +12,16 @@ from ..analysis import Analysis, register_analysis
 from ..errors import AngrBackwardSlicingError
 from .code_location import CodeLocation
 
-l = logging.getLogger(name="angr.analyses.backward_slicing")
+l = logging.getLogger(name="angr.analyses.backward_slice")
 
 class BackwardSlice(Analysis):
 
-    def __init__(self, cfg, cdg, ddg, cfg_node, stmt_id,
+    def __init__(self, cfg, cdg, ddg,
+                 targets=None,
+                 cfg_node=None,
+                 stmt_id=None,
                  control_flow_slice=False,
+                 same_function=False,
                  no_construct=False):
         """
         Create a backward slice from a specific statement based on provided control flow graph (CFG), control
@@ -30,8 +34,10 @@ class BackwardSlice(Analysis):
         :param cfg: The control flow graph.
         :param cdg: The control dependence graph.
         :param ddg: The data dependence graph.
-        :param irsb: The target CFGNode to reach. It should exist in the CFG.
-        :param stmt_id: The target statement to reach.
+        :param targets: A list of "target" that specify targets of the backward slices. Each target can be a tuple in
+            form of (cfg_node, stmt_idx), or a CodeLocation instance.
+        :param cfg_node: Deprecated. The target CFGNode to reach. It should exist in the CFG.
+        :param stmt_id: Deprecated. The target statement to reach.
         :param control_flow_slice: True/False, indicates whether we should slice only based on CFG. Sometimes when
                 acquiring DDG is difficult or impossible, you can just create a slice on your CFG.
                 Well, if you don't even have a CFG, then...
@@ -42,8 +48,25 @@ class BackwardSlice(Analysis):
         self._cdg = cdg
         self._ddg = ddg
 
-        self._target_cfgnode = cfg_node
-        self._target_stmt_idx = stmt_id
+        self._same_function = same_function
+
+        # All targets
+        self._targets = [ ]
+
+        if cfg_node is not None or stmt_id is not None:
+            l.warning('"cfg_node" and "stmt_id" are deprecated. Please use "targets" to pass in one or more targets.')
+
+            self._targets = [ (cfg_node, stmt_id) ]
+
+        if targets is not None:
+            for t in targets:
+                if isinstance(t, CodeLocation):
+                    node = self._cfg.get_any_node(t.simrun_addr)
+                    self._targets.append((node, t.stmt_idx))
+                elif type(t) is tuple:
+                    self._targets.append(t)
+                else:
+                    raise AngrBackwardSlicingError('Unsupported type of target %s' % t)
 
         # Save a list of taints to beginwwith at the beginning of each SimRun
         self.initial_taints_per_run = None
@@ -54,7 +77,7 @@ class BackwardSlice(Analysis):
         self._exit_statements_per_run = defaultdict(list)
 
         if not no_construct:
-            self._construct(self._target_cfgnode, stmt_id, control_flow_slice=control_flow_slice)
+            self._construct(self._targets, control_flow_slice=control_flow_slice)
 
     #
     # Public methods
@@ -67,18 +90,19 @@ class BackwardSlice(Analysis):
 
         # TODO: Support context-sensitivity
 
-        target_irsb_addr = self._target_cfgnode.addr
-        target_stmt = self._target_stmt_idx
-        start_point = start_point if start_point is not None else self.project.entry
+        targets = [ ]
+
+        for simrun, stmt_idx in self._targets:
+            targets.append((simrun.addr, stmt_idx))
 
         l.debug("Initializing AnnoCFG...")
-        target_irsb = self._cfg.get_any_node(target_irsb_addr)
-        anno_cfg = AnnotatedCFG(self.project, self._cfg, target_irsb_addr)
-        if target_stmt is not -1:
-            anno_cfg.set_last_stmt(target_irsb, target_stmt)
+        anno_cfg = AnnotatedCFG(self.project, self._cfg)
+
+        for simrun, stmt_idx in self._targets:
+            if stmt_idx is not -1:
+                anno_cfg.set_last_statement(simrun.addr, stmt_idx)
 
         for n in self._cfg.graph.nodes():
-
             run = n
 
             if run.addr in self._statements_per_run:
@@ -92,9 +116,6 @@ class BackwardSlice(Analysis):
 
             if dst.addr in self._statements_per_run and src.addr in self._statements_per_run:
                 anno_cfg.add_exit_to_whitelist(run.addr, dst.addr)
-
-            # TODO: expose here, maybe?
-            #anno_cfg.set_path_merge_points(self._path_merge_points)
 
         return anno_cfg
 
@@ -185,29 +206,28 @@ class BackwardSlice(Analysis):
     # Private methods
     #
 
-    def _construct(self, sim_run, stmt_id, control_flow_slice=False):
+    def _construct(self, targets, control_flow_slice=False):
         """
         Construct a dependency graph based on given parameters.
 
-        :param sim_run: The SimRun instance where the backward slice should start from
-        :param stmt_id: The statement ID where the backward slice starts from in the target SimRun instance. -1 for
-                        starting from the very last statement
+        :param targets: A list of tuples like (CFGNode, statement ID)
         :param control_flow_slice: Is the backward slicing only depends on CFG or not
         :return: None
         """
 
         if control_flow_slice:
-            self._construct_control_flow_slice(sim_run)
+            simruns = [ r for r, _ in targets ]
+            self._construct_control_flow_slice(simruns)
 
         else:
-            self._construct_default(sim_run, stmt_id)
+            self._construct_default(targets)
 
-    def _construct_control_flow_slice(self, irsb):
+    def _construct_control_flow_slice(self, simruns):
         """
         Build a slice of the program without considering the effect of data dependencies.
-        This ia an incorrect hack, but it should work fine with small programs.
+        This is an incorrect hack, but it should work fine with small programs.
 
-        :param irsb: The target IRSB. You probably wanna get it from the CFG somehow. It
+        :param simruns: A list of SimRun targets. You probably wanna get it from the CFG somehow. It
                     must exist in the CFG.
         :return: None
         """
@@ -218,19 +238,16 @@ class BackwardSlice(Analysis):
             l.error('Please build CFG first.')
 
         cfg = self._cfg.graph
-        if irsb not in cfg:
-            l.error('SimRun instance %s is not in the CFG.', irsb)
+        for simrun in simruns:
+            if simrun not in cfg:
+                l.error('SimRun instance %s is not in the CFG.', simrun)
 
-        reversed_cfg = networkx.DiGraph()
-        # Reverse the graph
-        for s, d in cfg.edges():
-            reversed_cfg.add_edge(d, s)
-
-        # Traverse forward in the reversed graph
         stack = [ ]
-        stack.append(irsb)
+        for simrun in simruns:
+            stack.append(simrun)
 
         self.runs_in_slice = networkx.DiGraph()
+        self.cfg_nodes_in_slice = networkx.DiGraph()
 
         self._statements_per_run = { }
         while stack:
@@ -238,44 +255,53 @@ class BackwardSlice(Analysis):
             block = stack.pop()
             if block.addr not in self._statements_per_run:
                 self._statements_per_run[block.addr] = True
-                # Get all successors of that block
-                successors = reversed_cfg.successors(block)
-                for succ in successors:
-                    stack.append(succ)
-                    self.runs_in_slice.add_edge(succ.addr, block.addr)
+                # Get all predecessors of that block
+                predecessors = cfg.predecessors(block)
+                for pred in predecessors:
+                    stack.append(pred)
+                    self.cfg_nodes_in_slice.add_edge(pred, block)
+                    self.runs_in_slice.add_edge(pred.addr, block.addr)
 
-    def _construct_default(self, cfg_node, stmt_id):
+    def _construct_default(self, targets):
         """
         Create a backward slice from a specific statement in a specific sim_run. This is done by traverse the CFG
         backwards, and mark all tainted statements based on dependence graphs (CDG and DDG) provided initially. The
         traversal terminated when we reach the entry point, or when there is no unresolved dependencies.
 
-        :param cfg_node: The CFGNode instance where the backward slice starts. It must be included in CFG and CDG.
-        :param stmt_id: ID of the target statement where the backward slice starts.
+        :param targets: A list of tuples like (cfg_node, stmt_idx), where cfg_node is a CFGNode instance where the
+                        backward slice starts, and it must be included in CFG and CDG. stmt_idx is the ID of the target
+                        statement where the backward slice starts.
         :return: None
         """
 
         # TODO: Support context-sensitivity
 
-        self.taint_graph = networkx.DiGraph()
+        l.debug("Constructing a default backward program slice")
 
-        if cfg_node not in self._cfg.graph:
-            raise AngrBackwardSlicingError('Target CFGNode %s is not in the CFG.', cfg_node)
+        self.taint_graph = networkx.DiGraph()
 
         taints = set()
         accessed_taints = set()
 
-        if stmt_id == -1:
-            new_taints = self._handle_control_dependence(cfg_node)
-            taints |= new_taints
+        # Fill in the taint set
 
-        else:
-            cl = CodeLocation(cfg_node, stmt_id)
-            taints.add(cl)
+        for cfg_node, stmt_idx in targets:
+            if cfg_node not in self._cfg.graph:
+                raise AngrBackwardSlicingError('Target CFGNode %s is not in the CFG.' % cfg_node)
+
+            if stmt_idx == -1:
+                new_taints = self._handle_control_dependence(cfg_node)
+                taints |= new_taints
+
+            else:
+                cl = CodeLocation(cfg_node.addr, stmt_idx)
+                taints.add(cl)
 
         while taints:
             # Pop a tainted code location
             tainted_cl = taints.pop()
+
+            l.debug("Checking taint %s...", tainted_cl)
 
             # Mark it as picked
             self._pick_statement(tainted_cl.simrun_addr, tainted_cl.stmt_idx)
@@ -284,20 +310,31 @@ class BackwardSlice(Analysis):
             accessed_taints.add(tainted_cl)
 
             # Pick all its data dependencies from data dependency graph
-            if tainted_cl in self._ddg:
-                predecessors = self._ddg.get_predecessors(tainted_cl)
+            if self._ddg is not None and tainted_cl in self._ddg:
+                if isinstance(self._ddg, networkx.DiGraph):
+                    predecessors = self._ddg.predecessors(tainted_cl)
+                else:
+                    # angr.analyses.DDG
+                    predecessors = self._ddg.get_predecessors(tainted_cl)
+                l.debug("Returned %d predecessors for %s from data dependence graph", len(predecessors), tainted_cl)
 
                 for p in predecessors:
                     if p not in accessed_taints:
                         taints.add(p)
 
+                    self.taint_graph.add_edge(p, tainted_cl)
+
             # Handle the control dependence
             for n in self._cfg.get_all_nodes(tainted_cl.simrun_addr):
                 new_taints = self._handle_control_dependence(n)
 
+                l.debug("Returned %d taints for %s from control dependence graph", len(new_taints), n)
+
                 for taint in new_taints:
                     if taint not in accessed_taints:
                         taints.add(taint)
+
+                    self.taint_graph.add_edge(taint, tainted_cl)
 
         # In the end, map the taint graph onto CFG
         self._map_to_cfg()
@@ -324,7 +361,9 @@ class BackwardSlice(Analysis):
         # Since we don't have a state, we have to rely on the pyvex block instead of SimIRSB
         # Just create the block from pyvex again - not a big deal
 
-        # TODO: Support hooks
+        if self.project.is_hooked(src_block.addr):
+            # Just return all exits for now
+            return { -1: [ target_block.addr ] }
 
         block = self.project.factory.block(src_block.addr)
         vex_block = block.vex
@@ -340,16 +379,28 @@ class BackwardSlice(Analysis):
         exit_stmt_ids['default'] = None
 
         # Find all paths from src_block to target_block
-        all_simple_paths = networkx.all_simple_paths(self._cfg.graph, src_block, target_block)
+        # FIXME: This is some crappy code written in a hurry. Replace the all_simple_paths() later.
+        all_simple_paths = list(networkx.all_simple_paths(self._cfg.graph, src_block, target_block, cutoff=3))
+
         for simple_path in all_simple_paths:
             if len(simple_path) <= 1:
                 # Oops, it looks that src_block and target_block are the same guy?
                 continue
 
+            if self._same_function:
+                # Examine this path and make sure it does not have call or return edge
+                for i in xrange(len(simple_path) - 1):
+                    jumpkind = self._cfg.graph[simple_path[i]][simple_path[i + 1]]['jumpkind']
+                    if jumpkind in ('Ijk_Call', 'Ijk_Ret'):
+                        return {  }
+
             # Get the first two nodes
             a, b = simple_path[0], simple_path[1]
             # Get the exit statement ID from CFG
             exit_stmt_id = self._cfg.get_exit_stmt_idx(a, b)
+            if exit_stmt_id is None:
+                continue
+
             # Mark it!
             if exit_stmt_ids[exit_stmt_id] is None:
                 exit_stmt_ids[exit_stmt_id] = [ b.addr ]

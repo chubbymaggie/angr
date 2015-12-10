@@ -1,7 +1,10 @@
 from collections import defaultdict
 import logging
+import bisect
+import time
 
 import networkx
+
 import simuvex
 import claripy
 import angr
@@ -13,10 +16,13 @@ from ..errors import AngrVFGError, AngrVFGRestartAnalysisNotice, AngrError
 l = logging.getLogger(name="angr.analyses.vfg")
 
 # The maximum tracing times of a basic block before we widen the results
-MAX_ANALYSIS_TIMES_WITHOUT_MERGING = 10
-MAX_ANALYSIS_TIMES = 20
+MAX_ANALYSIS_TIMES_WITHOUT_MERGING = 5
+MAX_ANALYSIS_TIMES = 10
 
 class VFGNode(object):
+    """
+    A descriptor of nodes in a Value-Flow Graph
+    """
     def __init__(self, addr, key, state=None):
         self.key = key
         self.addr = addr
@@ -63,9 +69,9 @@ class VFGNode(object):
             self.widened_state = s
 
 class VFG(Analysis):
-    '''
+    """
     This class represents a control-flow graph with static analysis result.
-    '''
+    """
 
     def __init__(self, cfg=None,
                  context_sensitivity_level=2,
@@ -73,7 +79,8 @@ class VFG(Analysis):
                  interfunction_level=0,
                  initial_state=None,
                  avoid_runs=None,
-                 remove_options=None
+                 remove_options=None,
+                 timeout=None
                  ):
         '''
         :param project: The project object.
@@ -98,6 +105,7 @@ class VFG(Analysis):
         self._context_sensitivity_level = context_sensitivity_level
         self._interfunction_level = interfunction_level
         self._state_options_to_remove = set() if remove_options is None else remove_options
+        self._timeout = timeout
 
         # Containers
         self.graph = None # TODO: Maybe we want to remove this line?
@@ -121,6 +129,40 @@ class VFG(Analysis):
         # Begin VFG construction!
         self._construct(initial_state=initial_state)
 
+    #
+    # Public methods
+    #
+
+    def get_any_node(self, addr):
+        """
+        Get any VFG node corresponding to the basic block at @addr.
+        Note that depending on the context sensitivity level, there might be
+        multiple nodes corresponding to different contexts. This function will
+        return the first one it encounters, which might not be what you want.
+        """
+        for n in self.graph.nodes():
+            if n.addr == addr:
+                return n
+
+    def irsb_from_node(self, node):
+        return self.project.factory.sim_run(node.state, addr=node.addr)
+
+    def get_paths(self, begin, end):
+        """
+        Get all the simple paths between @begin and @end.
+        Returns: a list of angr.Path instances.
+        """
+        paths = self._get_nx_paths(begin, end)
+        a_paths = []
+        for p in paths:
+            runs = map(self.irsb_from_node, p)
+            a_paths.append(angr.path.make_path(self.project, runs))
+            return a_paths
+
+    #
+    # Operations
+    #
+
     def copy(self):
         new_vfg = VFG(self.project)
         new_vfg._cfg = self._cfg
@@ -129,6 +171,7 @@ class VFG(Analysis):
         new_vfg._edge_map = self._edge_map.copy()
         return new_vfg
 
+    # Pickling helpers
     def __setstate__(self, s):
         self.__dict__.update(s)
         for n in self._nodes.values():
@@ -149,63 +192,9 @@ class VFG(Analysis):
                 state.uninitialized_access_handler = None
         return dict(self.__dict__)
 
-    def _prepare_state(self, function_start, initial_state, function_key):
-        # Crawl the binary, create CFG and fill all the refs inside project!
-        if initial_state is None:
-            if function_start not in self._function_initial_states:
-                # We have never saved any initial states for this function
-                # Gotta create a fresh state for it
-                s = self.project.factory.blank_state(mode="static",
-                                              add_options={ simuvex.o.FRESHNESS_ANALYSIS },
-                                              remove_options=self._state_options_to_remove,
-                )
-
-                if function_start != self.project.loader.main_bin.entry:
-                    # This function might have arguments passed on stack, so make
-                    # some room for them.
-                    # TODO: Decide the number of arguments and their positions
-                    #  during CFG analysis
-                    sp = s.registers.load('sp')
-                    # Set the address mapping
-                    sp_val = s.se.any_int(sp) # FIXME: What will happen if we lose track of multiple sp values?
-                    s.memory.set_stack_address_mapping(sp_val,
-                                                       s.memory.stack_id(function_start) + '_pre',
-                                                       0x0)
-                    new_sp = sp - 160
-                    s.registers.store('sp', new_sp)
-            else:
-                if function_key is None:
-                    l.debug('We should combine all existing states for this function, then analyze it.')
-                    merged_state = None
-                    for state in self._function_initial_states[function_start].values():
-                        if merged_state is None:
-                            merged_state = state
-                        else:
-                            merged_state, _, _ = merged_state.merge(state)
-                    s = merged_state
-                elif function_key in self._function_initial_states[function_start]:
-                    l.debug('Loading previously saved state for function 0x%x %s', function_start,
-                            CallStack.stack_suffix_to_string(function_key))
-                    s = self._function_initial_states[function_start][function_key]
-                else:
-                    raise AngrVFGError('Initial state for function 0x%x and function key %s is not found.' %
-                                       (function_start, CallStack.stack_suffix_to_string(function_key)))
-        else:
-            if function_key is not None:
-                # Warn the user
-                l.warning('Arguments "function_key" and "initial_state" should not be specified together. ' +
-                          'Using specified initial_state as the state.')
-            s = initial_state
-
-        # Set the stack address mapping for the initial stack
-        s.memory.set_stack_size(s.arch.stack_size)
-        initial_sp = s.se.any_int(s.registers.load('sp')) # FIXME: This is bad, as it may lose tracking of multiple sp values
-        initial_sp -= s.arch.bits / 8
-        s.memory.set_stack_address_mapping(initial_sp,
-                                           s.memory.stack_id(function_start),
-                                           function_start)
-
-        return s
+    #
+    # Main analysis routines
+    #
 
     def _construct(self, initial_state=None):
         """
@@ -242,6 +231,8 @@ class VFG(Analysis):
         #    self._cfg.graph.remove_edge(src, dst)
 
         restart_analysis = True
+
+        self._start_timestamp = time.time()
 
         while restart_analysis:
 
@@ -295,10 +286,11 @@ class VFG(Analysis):
         entry_state = loaded_state.copy()
         entry_state.options.add(simuvex.o.FRESHNESS_ANALYSIS)
         entry_path = self.project.factory.path(entry_state)
-        entry_wrapper = EntryWrapper(entry_path, self._context_sensitivity_level)
+        entry_wrapper = EntryWrapper(entry_path, self._context_sensitivity_level, jumpkind='Ijk_Boring')
 
         # Initialize a worklist
-        worklist = [ entry_wrapper ]
+        self._worklist = [ ]
+        self._worklist_append_entry(entry_wrapper)
 
         # Counting how many times a basic block has been traced
         tracing_times = defaultdict(int)
@@ -319,16 +311,20 @@ class VFG(Analysis):
         retn_target_sources = defaultdict(list)
 
         # Iteratively analyze every exit
-        while len(worklist):
-            entry_wrapper = worklist.pop()
+        while len(self._worklist):
+            entry_wrapper = self._worklist_pop_entry()
 
             # Process the popped path
-            self._handle_entry(entry_wrapper, worklist,
+            self._handle_entry(entry_wrapper,
                               exit_targets, fake_func_return_paths,
                               tracing_times, retn_target_sources
                               )
 
-            while len(worklist) == 0 and len(fake_func_return_paths) > 0:
+            if self._timeout is not None and time.time() - self._start_timestamp > self._timeout:
+                l.debug('Times out. Terminate the analysis.')
+                break
+
+            while len(self._worklist) == 0 and len(fake_func_return_paths) > 0:
                 # We don't have any paths remaining. Let's pop a previously-missing return to
                 # process
                 fake_exit_tuple = fake_func_return_paths.keys()[0]
@@ -341,10 +337,11 @@ class VFG(Analysis):
 
                 new_path = self.project.factory.path(fake_exit_state)
                 new_path_wrapper = EntryWrapper(new_path,
-                                                  self._context_sensitivity_level,
-                                                  call_stack=fake_exit_call_stack,
-                                                  bbl_stack=fake_exit_bbl_stack)
-                worklist.append(new_path_wrapper)
+                                                self._context_sensitivity_level,
+                                                jumpkind=new_path.state.scratch.jumpkind,
+                                                call_stack=fake_exit_call_stack,
+                                                bbl_stack=fake_exit_bbl_stack)
+                self._worklist_append_entry(new_path_wrapper)
                 l.debug("Tracing a missing return 0x%08x, %s", fake_exit_addr,
                         "->".join([hex(i) for i in fake_exit_tuple if i is not None]))
                 break
@@ -366,130 +363,11 @@ class VFG(Analysis):
                 else:
                     self.final_states.append(n.state)
 
-    def _create_graph(self, return_target_sources=None):
-        '''
-        Create a DiGraph out of the existing edge map.
-        :param return_target_sources: Used for making up those missing returns
-        :return: A networkx.DiGraph() object
-        '''
-        exit_targets = self._edge_map
+    #
+    # Handlers for entries, states, some special events (merging, etc.)
+    #
 
-        if return_target_sources is None:
-            # We set it to a defaultdict in order to be consistent with the
-            # actual parameter.
-            return_target_sources = defaultdict(list)
-
-        cfg = networkx.DiGraph()
-        # The corner case: add a node to the graph if there is only one block
-        if len(self._nodes) == 1:
-            cfg.add_node(self._nodes[self._nodes.keys()[0]])
-
-        # Adding edges
-        for tpl, targets in exit_targets.items():
-            basic_block = self._nodes[tpl] # Cannot fail :)
-            for ex, jumpkind in targets:
-                if ex in self._nodes:
-                    target_bbl = self._nodes[ex]
-                    cfg.add_edge(basic_block, target_bbl, jumpkind=jumpkind)
-
-                    # Add edges for possibly missing returns
-                    if basic_block.addr in return_target_sources:
-                        for src_irsb_key in \
-                                return_target_sources[basic_block.addr]:
-                            cfg.add_edge(self._nodes[src_irsb_key],
-                                               basic_block, jumpkind="Ijk_Ret")
-                else:
-                    # Debugging output
-                    def addr_formalize(addr):
-                        if addr is None:
-                            return "None"
-                        else:
-                            return "0x%08x" % addr
-
-                    s = "(["
-                    for addr in ex[:-1]:
-                        s += addr_formalize(addr) + ", "
-                    s += "] %s)" % addr_formalize(ex[-1])
-                    l.warning("Key %s does not exist.", s)
-
-        return cfg
-
-    def _get_simrun(self, state, current_path, addr):
-        error_occured = False
-        restart_analysis = False
-
-        jumpkind = 'Ijk_Boring'
-        if current_path.state.scratch.jumpkind:
-            jumpkind = current_path.state.scratch.jumpkind
-
-        try:
-            sim_run = self.project.factory.sim_run(current_path.state, jumpkind=jumpkind)
-        except simuvex.SimUninitializedAccessError as ex:
-            l.error("Found an uninitialized access (used as %s) at expression %s.", ex.expr_type, ex.expr)
-            self._add_expression_to_initialize(ex.expr, ex.expr_type)
-            sim_run = None
-            error_occured = True
-            restart_analysis = True
-        except simuvex.SimIRSBError as ex:
-            # It's a tragedy that we came across some instructions that VEX
-            # does not support. I'll create a terminating stub there
-            l.error("SimIRSBError occurred(%s). Creating a PathTerminator.", ex)
-            error_occured = True
-            sim_run = \
-                simuvex.procedures.SimProcedures["stubs"]["PathTerminator"](
-                    state, addr=addr)
-        except claripy.ClaripyError as ex:
-            l.error("ClaripyError: ", exc_info=True)
-            error_occured = True
-            # Generate a PathTerminator to terminate the current path
-            sim_run = \
-                simuvex.procedures.SimProcedures["stubs"]["PathTerminator"](
-                    state, addr=addr)
-        except simuvex.SimError as ex:
-            l.error("SimError: ", exc_info=True)
-
-            error_occured = True
-            # Generate a PathTerminator to terminate the current path
-            sim_run = \
-                simuvex.procedures.SimProcedures["stubs"]["PathTerminator"](
-                    state, addr=addr)
-        except AngrError as ex:
-            #segment = self.project.loader.main_bin.in_which_segment(addr)
-            l.error("AngrError %s when creating SimRun at 0x%x",
-                    ex, addr)
-            # We might be on a wrong branch, and is likely to encounter the
-            # "No bytes in memory xxx" exception
-            # Just ignore it
-            error_occured = True
-            sim_run = None
-
-        return sim_run, error_occured, restart_analysis
-
-    def _remove_pending_return(self, entry_wrapper, pending_returns):
-        """
-        Remove all pending returns that are related to the current entry.
-        """
-
-        # Build the tuples that we want to remove from the dict fake_func_retn_exits
-        tpls_to_remove = [ ]
-        call_stack_copy = entry_wrapper.call_stack_copy()
-        while call_stack_copy.get_ret_target() is not None:
-            ret_target = call_stack_copy.get_ret_target()
-            # Remove the current call stack frame
-            call_stack_copy.ret(ret_target)
-            call_stack_suffix = call_stack_copy.stack_suffix(self._context_sensitivity_level)
-            tpl = call_stack_suffix + (ret_target,)
-            tpls_to_remove.append(tpl)
-
-        # Remove those tuples from the dict
-        for tpl in tpls_to_remove:
-            if tpl in pending_returns:
-                del pending_returns[tpl]
-                l.debug("Removed (%s) from FakeExits dict.",
-                        ",".join([hex(i) if i is not None else 'None' for i in tpl]))
-
-    def _handle_entry(self, entry_wrapper, remaining_entries, exit_targets,
-                     pending_returns, tracing_times, retn_target_sources):
+    def _handle_entry(self, entry_wrapper, exit_targets, pending_returns, tracing_times, retn_target_sources):
         '''
         Handles an entry in the program.
 
@@ -627,25 +505,203 @@ class VFG(Analysis):
 
             self._handle_successor(suc_state, entry_wrapper, all_successors, is_call_jump, is_return_jump, call_target,
                                    current_function_address, call_stack_suffix, retn_target_sources, pending_returns,
-                                   tracing_times, remaining_entries, exit_targets, is_narrowing, _dbg_exit_status)
+                                   tracing_times, exit_targets, is_narrowing, _dbg_exit_status)
 
         # Debugging output
-        function_name = self.project.loader.find_symbol_name(simrun.addr)
-        module_name = self.project.loader.find_module_name(simrun.addr)
+        if l.level == logging.DEBUG:
+            function_name = self.project.loader.find_symbol_name(simrun.addr)
+            module_name = self.project.loader.find_module_name(simrun.addr)
 
-        l.debug("Basic block %s %s", simrun, "->".join([hex(i) for i in call_stack_suffix if i is not None]))
-        l.debug("(Function %s of binary %s)", function_name, module_name)
-        l.debug("|    Has simulated retn: %s", is_call_jump)
-        for suc_state in all_successors:
-            if is_call_jump and suc_state.scratch.jumpkind == "Ijk_FakeRet":
-                exit_type_str = "Simulated Ret"
-            else:
-                exit_type_str = "-"
-            try:
-                l.debug("|    target: %s %s [%s] %s", hex(suc_state.se.exactly_int(suc_state.ip)), _dbg_exit_status[suc_state], exit_type_str, suc_state.scratch.jumpkind)
-            except simuvex.SimValueError:
-                l.debug("|    target cannot be concretized. %s [%s] %s", _dbg_exit_status[suc_state], exit_type_str, suc_state.scratch.jumpkind)
-        l.debug("len(remaining_exits) = %d, len(fake_func_retn_exits) = %d", len(remaining_entries), len(pending_returns))
+            l.debug("Basic block %s %s", simrun, "->".join([hex(i) for i in call_stack_suffix if i is not None]))
+            l.debug("(Function %s of binary %s)", function_name, module_name)
+            l.debug("|    Has simulated retn: %s", is_call_jump)
+            for suc_state in all_successors:
+                if is_call_jump and suc_state.scratch.jumpkind == "Ijk_FakeRet":
+                    exit_type_str = "Simulated Ret"
+                else:
+                    exit_type_str = "-"
+                try:
+                    l.debug("|    target: %s %s [%s] %s", hex(suc_state.se.exactly_int(suc_state.ip)), _dbg_exit_status[suc_state], exit_type_str, suc_state.scratch.jumpkind)
+                except simuvex.SimValueError:
+                    l.debug("|    target cannot be concretized. %s [%s] %s", _dbg_exit_status[suc_state], exit_type_str, suc_state.scratch.jumpkind)
+            l.debug("len(remaining_exits) = %d, len(fake_func_retn_exits) = %d", len(self._worklist), len(pending_returns))
+
+    def _handle_successor(self, suc_state, entry_wrapper, all_successors, is_call_jump, is_return_jump, call_target,
+                          current_function_address, call_stack_suffix, retn_target_sources, pending_returns,
+                          tracing_count, exit_targets, is_narrowing, _dbg_exit_status):
+
+        #
+        # Extract initial values
+        #
+        addr = entry_wrapper.path.addr
+        jumpkind = suc_state.scratch.jumpkind
+        se = suc_state.se
+
+        self._events.extend([ i for i in suc_state.log.events if not isinstance(i, simuvex.SimAction) ])
+
+        #
+        # Get instruction pointer
+        #
+        try:
+            if is_return_jump:
+                # FIXME: This is a bad practice...
+                ret_target = entry_wrapper.call_stack.get_ret_target()
+                if ret_target is None:
+                    # We have no where to go according to our call stack
+                    # However, we still store the state as it is probably the last available state of the analysis
+                    call_stack_suffix = entry_wrapper.call_stack_suffix()
+                    simrun_key = call_stack_suffix + (addr, )
+                    # self._normal_states[simrun_key] = suc_state
+                    return
+
+                suc_state.ip = ret_target
+
+            if len(suc_state.se.any_n_int(suc_state.ip, 2)) > 1:
+                if is_return_jump:
+                    # It might be caused by state merging
+                    # We may retrieve the correct ip from call stack
+                    suc_state.ip = entry_wrapper.call_stack.get_ret_target()
+
+                else:
+                    # Currently we assume a legit jumping target cannot have more than 256 concrete values
+                    MAX_NUMBER_OF_CONCRETE_VALUES = 256
+
+                    all_possible_ips = suc_state.se.any_n_int(suc_state.ip, MAX_NUMBER_OF_CONCRETE_VALUES + 1)
+
+                    if len(all_possible_ips) > MAX_NUMBER_OF_CONCRETE_VALUES:
+                        l.warning("IP can be concretized to more than %d values, which means it might be corrupted.",
+                                  MAX_NUMBER_OF_CONCRETE_VALUES)
+
+                    else:
+                        # Call this function for each possible IP
+                        for ip in all_possible_ips:
+                            suc_state_ = suc_state.copy()
+                            suc_state_.ip = ip
+
+                            self._handle_successor(
+                                suc_state_, entry_wrapper, all_successors, is_call_jump, is_return_jump, call_target,
+                                current_function_address, call_stack_suffix, retn_target_sources, pending_returns,
+                                tracing_count, exit_targets, is_narrowing, _dbg_exit_status)
+                    return
+
+            successor_ip = suc_state.se.exactly_int(suc_state.ip)
+        except simuvex.SimValueError:
+            # TODO: Should fall back to reading targets from CFG
+            # It cannot be concretized currently. Maybe we could handle
+            # it later, maybe it just cannot be concretized
+            return
+
+        # Make a copy of the state in case we use it later
+        successor_state = suc_state.copy()
+
+        # Try to remove the unnecessary fakeret successor
+        fakeret_successor = None
+        if self._is_call_jump(jumpkind):
+            fakeret_successor = all_successors[-1]
+
+            # Check if that function is returning
+            if self._cfg is not None:
+                func = self._cfg.function_manager.function(call_target)
+                if func is not None and func.returning is False and len(all_successors) == 2:
+                    # Remove the fake return as it is not returning anyway...
+                    del all_successors[-1]
+                    fakeret_successor = None
+
+        if self._is_call_jump(jumpkind) and \
+                len(entry_wrapper.call_stack) > self._interfunction_level:
+            l.debug('We are not tracing into a new function 0x%x because we run out of energy :-(', successor_ip)
+            # However, we do want to save out the state here
+            self._save_state(entry_wrapper, successor_ip, successor_state)
+
+            # Go on to handle the next exit
+            return
+
+        # Create a new call stack
+        new_call_stack = self._create_callstack(entry_wrapper, successor_ip, jumpkind, is_call_jump, fakeret_successor)
+        if new_call_stack is None:
+            l.debug("Cannot create a new callstack for address 0x%x", successor_ip)
+            return
+        new_call_stack_suffix = new_call_stack.stack_suffix(self._context_sensitivity_level)
+        new_tpl = new_call_stack_suffix + (successor_ip, )
+
+        # Generate the new BBL stack of target block
+        new_bbl_stack = self._create_bblstack(entry_wrapper, jumpkind, successor_ip, is_call_jump, call_stack_suffix,
+                                              new_call_stack_suffix, current_function_address)
+
+        # Generate new exits
+        if jumpkind == "Ijk_Ret" and not is_call_jump:
+            # This is the real retn exit
+            # Remember this retn!
+            retn_target_sources[successor_ip].append(call_stack_suffix + (addr, ))
+            # Check if this retn is inside our fake_func_retn_exits set
+            if new_tpl in pending_returns:
+                del pending_returns[new_tpl]
+
+        if jumpkind == "Ijk_FakeRet" and is_call_jump:
+            # This is the default "fake" return successor generated at each
+            # call. Save them first, but don't process them right
+            # away
+
+            # Clear the useless values (like return addresses, parameters) on stack if needed
+            if self._cfg is not None:
+                current_function = self._cfg.function_manager.function(call_target)
+                if current_function is not None:
+                    sp_difference = current_function.sp_delta
+                else:
+                    sp_difference = 0
+                reg_sp_offset = successor_state.arch.sp_offset
+                reg_sp_expr = successor_state.registers.load(reg_sp_offset) + sp_difference
+                successor_state.registers.store(successor_state.arch.sp_offset, reg_sp_expr)
+
+                # Clear the return value with a TOP
+                top_si = successor_state.se.TSI(successor_state.arch.bits)
+                successor_state.registers.store(successor_state.arch.ret_offset, top_si)
+
+                pending_returns[new_tpl] = \
+                    (successor_state, new_call_stack, new_bbl_stack)
+                _dbg_exit_status[suc_state] = "Appended to fake_func_retn_exits"
+
+        else:
+            successor_path = self.project.factory.path(successor_state)
+            if simuvex.o.ABSTRACT_MEMORY in suc_state.options:
+                if self._is_call_jump(suc_state.scratch.jumpkind):
+                    # If this is a call, we create a new stack address mapping
+                    reg_sp_si = self._create_stack_region(successor_path.state, successor_path.addr)
+
+                    # Save the new sp register
+                    new_reg_sp_expr = successor_path.state.se.ValueSet(bits=suc_state.arch.bits)
+                    new_reg_sp_expr._model_vsa.set_si('global', reg_sp_si.copy())
+                    reg_sp_offset = successor_state.arch.sp_offset
+                    successor_path.state.registers.store(reg_sp_offset, new_reg_sp_expr)
+
+                elif suc_state.scratch.jumpkind == "Ijk_Ret":
+                    # Remove the existing stack address mapping
+                    # FIXME: Now we are assuming the sp is restored to its original value
+                    reg_sp_offset = successor_path.state.arch.sp_offset
+                    reg_sp_expr = successor_path.state.registers.load(reg_sp_offset)
+
+                    if isinstance(reg_sp_expr._model_vsa, claripy.vsa.StridedInterval):
+                        reg_sp_si = reg_sp_expr._model_vsa
+                        reg_sp_val = reg_sp_si.min
+                    elif isinstance(reg_sp_expr._model_vsa, claripy.vsa.ValueSet):
+                        reg_sp_si = reg_sp_expr._model_vsa.items()[0][1]
+                        reg_sp_val = reg_sp_si.min
+                    # TODO: Finish it!
+
+            new_exit_wrapper = EntryWrapper(successor_path,
+                                            self._context_sensitivity_level,
+                                            jumpkind=successor_path.state.scratch.jumpkind,
+                                            call_stack=new_call_stack,
+                                            bbl_stack=new_bbl_stack,
+                                            is_narrowing=is_narrowing)
+            r = self._worklist_append_entry(new_exit_wrapper)
+            _dbg_exit_status[suc_state] = r
+
+        if not is_call_jump or jumpkind != "Ijk_FakeRet":
+            exit_targets[call_stack_suffix + (addr,)].append((new_tpl, jumpkind))
+        else:
+            # This is the fake return!
+            exit_targets[call_stack_suffix + (addr,)].append((new_tpl, "Ijk_FakeRet"))
 
     def _handle_states_merging(self, node, addr, new_state, tracing_times):
         """
@@ -727,209 +783,9 @@ class VFG(Analysis):
 
             return False, None
 
-    def _handle_successor(self, suc_state, entry_wrapper, all_successors, is_call_jump, is_return_jump, call_target,
-                          current_function_address, call_stack_suffix, retn_target_sources, pending_returns,
-                          tracing_count, remaining_entries, exit_targets, is_narrowing, _dbg_exit_status):
-
-        #
-        # Extract initial values
-        #
-        addr = entry_wrapper.path.addr
-        jumpkind = suc_state.scratch.jumpkind
-        se = suc_state.se
-
-        self._events.extend([ i for i in suc_state.log.events if not isinstance(i, simuvex.SimAction) ])
-
-        #
-        # Get instruction pointer
-        #
-        try:
-            if is_return_jump:
-                # FIXME: This is a bad practice...
-                ret_target = entry_wrapper.call_stack.get_ret_target()
-                if ret_target is None:
-                    # We have no where to go according to our call stack
-                    # However, we still store the state as it is probably the last available state of the analysis
-                    call_stack_suffix = entry_wrapper.call_stack_suffix()
-                    simrun_key = call_stack_suffix + (addr, )
-                    # self._normal_states[simrun_key] = suc_state
-                    return
-
-                suc_state.ip = ret_target
-
-            if len(suc_state.se.any_n_int(suc_state.ip, 2)) > 1:
-                if is_return_jump:
-                    # It might be caused by state merging
-                    # We may retrieve the correct ip from call stack
-                    suc_state.ip = entry_wrapper.call_stack.get_ret_target()
-
-                else:
-                    # Currently we assume a legit jumping target cannot have more than 256 concrete values
-                    MAX_NUMBER_OF_CONCRETE_VALUES = 256
-
-                    all_possible_ips = suc_state.se.any_n_int(suc_state.ip, MAX_NUMBER_OF_CONCRETE_VALUES + 1)
-
-                    if len(all_possible_ips) > MAX_NUMBER_OF_CONCRETE_VALUES:
-                        l.warning("IP can be concretized to more than %d values, which means it might be corrupted.",
-                                  MAX_NUMBER_OF_CONCRETE_VALUES)
-
-                    else:
-                        # Call this function for each possible IP
-                        for ip in all_possible_ips:
-                            suc_state_ = suc_state.copy()
-                            suc_state_.ip = ip
-
-                            self._handle_successor(
-                                suc_state_, entry_wrapper, all_successors, is_call_jump, is_return_jump, call_target,
-                                current_function_address, call_stack_suffix, retn_target_sources, pending_returns,
-                                tracing_count, remaining_entries, exit_targets, is_narrowing, _dbg_exit_status)
-                    return
-
-            successor_ip = suc_state.se.exactly_int(suc_state.ip)
-        except simuvex.SimValueError:
-            # TODO: Should fall back to reading targets from CFG
-            # It cannot be concretized currently. Maybe we could handle
-            # it later, maybe it just cannot be concretized
-            return
-
-        # Make a copy of the state in case we use it later
-        successor_state = suc_state.copy()
-
-        # Try to remove the unnecessary fakeret successor
-        fakeret_successor = None
-        if self._is_call_jump(jumpkind):
-            fakeret_successor = all_successors[-1]
-
-            # Check if that function is returning
-            if self._cfg is not None:
-                func = self._cfg.function_manager.function(call_target)
-                if func is not None and func.returning is False and len(all_successors) == 2:
-                    # Remove the fake return as it is not returning anyway...
-                    del all_successors[-1]
-                    fakeret_successor = None
-
-        if self._is_call_jump(jumpkind) and \
-                len(entry_wrapper.call_stack) > self._interfunction_level:
-            l.debug('We are not tracing into a new function 0x%x because we run out of energy :-(', successor_ip)
-            # However, we do want to save out the state here
-            self._save_state(entry_wrapper, successor_ip, successor_state)
-
-            # Go on to handle the next exit
-            return
-
-        # Create a new call stack
-        new_call_stack = self._create_callstack(entry_wrapper, successor_ip, jumpkind, is_call_jump, fakeret_successor)
-        if new_call_stack is None:
-            l.debug("Cannot create a new callstack for address 0x%x", successor_ip)
-            return
-        new_call_stack_suffix = new_call_stack.stack_suffix(self._context_sensitivity_level)
-        new_tpl = new_call_stack_suffix + (successor_ip, )
-
-        # Generate the new BBL stack of target block
-        new_bbl_stack = self._create_bblstack(entry_wrapper, jumpkind, successor_ip, is_call_jump, call_stack_suffix,
-                                              new_call_stack_suffix, current_function_address)
-
-        # Generate new exits
-        if jumpkind == "Ijk_Ret" and not is_call_jump:
-            # This is the real retn exit
-            # Remember this retn!
-            retn_target_sources[successor_ip].append(call_stack_suffix + (addr, ))
-            # Check if this retn is inside our fake_func_retn_exits set
-            if new_tpl in pending_returns:
-                del pending_returns[new_tpl]
-
-        if jumpkind == "Ijk_FakeRet" and is_call_jump:
-            # This is the default "fake" return successor generated at each
-            # call. Save them first, but don't process them right
-            # away
-
-            # Clear the useless values (like return addresses, parameters) on stack if needed
-            if self._cfg is not None:
-                current_function = self._cfg.function_manager.function(call_target)
-                if current_function is not None:
-                    sp_difference = current_function.sp_delta
-                else:
-                    sp_difference = 0
-                reg_sp_offset = successor_state.arch.sp_offset
-                reg_sp_expr = successor_state.registers.load(reg_sp_offset) + sp_difference
-                successor_state.registers.store(successor_state.arch.sp_offset, reg_sp_expr)
-
-                # Clear the return value with a TOP
-                top_si = successor_state.se.TopStridedInterval(successor_state.arch.bits)
-                successor_state.registers.store(successor_state.arch.ret_offset, top_si)
-
-                pending_returns[new_tpl] = \
-                    (successor_state, new_call_stack, new_bbl_stack)
-                _dbg_exit_status[suc_state] = "Appended to fake_func_retn_exits"
-
-        else:
-            successor_path = self.project.factory.path(successor_state)
-            if simuvex.o.ABSTRACT_MEMORY in suc_state.options:
-                if self._is_call_jump(suc_state.scratch.jumpkind):
-                    # If this is a call, we create a new stack address mapping
-                    reg_sp_si = self._create_stack_region(successor_path.state, successor_path.addr)
-
-                    # Save the new sp register
-                    new_reg_sp_expr = successor_path.state.se.ValueSet(bits=suc_state.arch.bits)
-                    new_reg_sp_expr.model.set_si('global', reg_sp_si.copy())
-                    reg_sp_offset = successor_state.arch.sp_offset
-                    successor_path.state.registers.store(reg_sp_offset, new_reg_sp_expr)
-
-                elif suc_state.scratch.jumpkind == "Ijk_Ret":
-                    # Remove the existing stack address mapping
-                    # FIXME: Now we are assuming the sp is restored to its original value
-                    reg_sp_offset = successor_path.state.arch.sp_offset
-                    reg_sp_expr = successor_path.state.registers.load(reg_sp_offset)
-
-                    if isinstance(reg_sp_expr.model, claripy.vsa.StridedInterval):
-                        reg_sp_si = reg_sp_expr.model
-                        reg_sp_val = reg_sp_si.min
-                    elif isinstance(reg_sp_expr.model, claripy.vsa.ValueSet):
-                        reg_sp_si = reg_sp_expr.model.items()[0][1]
-                        reg_sp_val = reg_sp_si.min
-                    # TODO: Finish it!
-
-            new_exit_wrapper = EntryWrapper(successor_path,
-                                            self._context_sensitivity_level,
-                                            call_stack=new_call_stack,
-                                            bbl_stack=new_bbl_stack,
-                                            is_narrowing=is_narrowing)
-            r = self._append_to_remaining_entries(remaining_entries, new_exit_wrapper)
-            _dbg_exit_status[suc_state] = r
-
-        if not is_call_jump or jumpkind != "Ijk_FakeRet":
-            exit_targets[call_stack_suffix + (addr,)].append((new_tpl, jumpkind))
-        else:
-            # This is the fake return!
-            exit_targets[call_stack_suffix + (addr,)].append((new_tpl, "Ijk_FakeRet"))
-
-    def _is_call_jump(self, jumpkind):
-        if jumpkind == 'Ijk_Call' or jumpkind.startswith('Ijk_Sys_'):
-            return True
-        return False
-
-    def _append_to_remaining_entries(self, remaining_entries, exit_wrapper):
-        simrun_key = exit_wrapper.call_stack_suffix() + (exit_wrapper.path.addr, )
-        simrun_key = simrun_key[1 : ]
-
-        node = self._cfg.get_node(simrun_key)
-
-        if node is None:
-            result = "Appended [not in CFG]"
-            remaining_entries.append(exit_wrapper)
-
-        else:
-            in_degree = self._cfg.graph.in_degree(node)
-
-            if in_degree <= 1:
-                result = "Appended [not a merge point]"
-                remaining_entries.append(exit_wrapper)
-
-            else:
-                result = "Inserted at front [a merge point]"
-                remaining_entries.insert(0, exit_wrapper)
-
-        return result
+    #
+    # State widening, merging, and narrowing
+    #
 
     def _widen_states(self, old_state, new_state):
         """
@@ -1003,23 +859,272 @@ class VFG(Analysis):
 
         return merged_state, merging_occurred
 
+
+    #
+    # Helper methods
+    #
+
+    def _prepare_state(self, function_start, initial_state, function_key):
+        # Crawl the binary, create CFG and fill all the refs inside project!
+        if initial_state is None:
+            if function_start not in self._function_initial_states:
+                # We have never saved any initial states for this function
+                # Gotta create a fresh state for it
+                s = self.project.factory.blank_state(mode="static",
+                                              add_options={ simuvex.o.FRESHNESS_ANALYSIS },
+                                              remove_options=self._state_options_to_remove,
+                )
+
+                if function_start != self.project.loader.main_bin.entry:
+                    # This function might have arguments passed on stack, so make
+                    # some room for them.
+                    # TODO: Decide the number of arguments and their positions
+                    #  during CFG analysis
+                    sp = s.registers.load('sp')
+                    # Set the address mapping
+                    sp_val = s.se.any_int(sp) # FIXME: What will happen if we lose track of multiple sp values?
+                    s.memory.set_stack_address_mapping(sp_val,
+                                                       s.memory.stack_id(function_start) + '_pre',
+                                                       0x0)
+                    new_sp = sp - 160
+                    s.registers.store('sp', new_sp)
+            else:
+                if function_key is None:
+                    l.debug('We should combine all existing states for this function, then analyze it.')
+                    merged_state = None
+                    for state in self._function_initial_states[function_start].values():
+                        if merged_state is None:
+                            merged_state = state
+                        else:
+                            merged_state, _, _ = merged_state.merge(state)
+                    s = merged_state
+                elif function_key in self._function_initial_states[function_start]:
+                    l.debug('Loading previously saved state for function 0x%x %s', function_start,
+                            CallStack.stack_suffix_to_string(function_key))
+                    s = self._function_initial_states[function_start][function_key]
+                else:
+                    raise AngrVFGError('Initial state for function 0x%x and function key %s is not found.' %
+                                       (function_start, CallStack.stack_suffix_to_string(function_key)))
+        else:
+            if function_key is not None:
+                # Warn the user
+                l.warning('Arguments "function_key" and "initial_state" should not be specified together. ' +
+                          'Using specified initial_state as the state.')
+            s = initial_state
+
+        # Set the stack address mapping for the initial stack
+        s.memory.set_stack_size(s.arch.stack_size)
+        initial_sp = s.se.any_int(s.registers.load('sp')) # FIXME: This is bad, as it may lose tracking of multiple sp values
+        initial_sp -= s.arch.bits / 8
+        s.memory.set_stack_address_mapping(initial_sp,
+                                           s.memory.stack_id(function_start),
+                                           function_start)
+
+        return s
+
+    def _create_graph(self, return_target_sources=None):
+        '''
+        Create a DiGraph out of the existing edge map.
+        :param return_target_sources: Used for making up those missing returns
+        :return: A networkx.DiGraph() object
+        '''
+        exit_targets = self._edge_map
+
+        if return_target_sources is None:
+            # We set it to a defaultdict in order to be consistent with the
+            # actual parameter.
+            return_target_sources = defaultdict(list)
+
+        cfg = networkx.DiGraph()
+        # The corner case: add a node to the graph if there is only one block
+        if len(self._nodes) == 1:
+            cfg.add_node(self._nodes[self._nodes.keys()[0]])
+
+        # Adding edges
+        for tpl, targets in exit_targets.items():
+            basic_block = self._nodes[tpl] # Cannot fail :)
+            for ex, jumpkind in targets:
+                if ex in self._nodes:
+                    target_bbl = self._nodes[ex]
+                    cfg.add_edge(basic_block, target_bbl, jumpkind=jumpkind)
+
+                    # Add edges for possibly missing returns
+                    if basic_block.addr in return_target_sources:
+                        for src_irsb_key in \
+                                return_target_sources[basic_block.addr]:
+                            cfg.add_edge(self._nodes[src_irsb_key],
+                                               basic_block, jumpkind="Ijk_Ret")
+                else:
+                    # Debugging output
+                    def addr_formalize(addr):
+                        if addr is None:
+                            return "None"
+                        else:
+                            return "0x%08x" % addr
+
+                    s = "(["
+                    for addr in ex[:-1]:
+                        s += addr_formalize(addr) + ", "
+                    s += "] %s)" % addr_formalize(ex[-1])
+                    l.warning("Key %s does not exist.", s)
+
+        return cfg
+
+    def _get_simrun(self, state, current_path, addr):
+        error_occured = False
+        restart_analysis = False
+
+        jumpkind = 'Ijk_Boring'
+        if current_path.state.scratch.jumpkind:
+            jumpkind = current_path.state.scratch.jumpkind
+
+        try:
+            sim_run = self.project.factory.sim_run(current_path.state, jumpkind=jumpkind)
+        except simuvex.SimUninitializedAccessError as ex:
+            l.error("Found an uninitialized access (used as %s) at expression %s.", ex.expr_type, ex.expr)
+            # We don't restart the analysis if it returns False, which indicates something is wrong
+            restart_analysis = self._add_expression_to_initialize(ex.expr, ex.expr_type)
+
+            sim_run = None
+            error_occured = True
+        except simuvex.SimIRSBError as ex:
+            # It's a tragedy that we came across some instructions that VEX
+            # does not support. I'll create a terminating stub there
+            l.error("SimIRSBError occurred(%s). Creating a PathTerminator.", ex)
+            error_occured = True
+            sim_run = \
+                simuvex.procedures.SimProcedures["stubs"]["PathTerminator"](
+                    state, addr=addr)
+        except claripy.ClaripyError as ex:
+            l.error("ClaripyError: ", exc_info=True)
+            error_occured = True
+            # Generate a PathTerminator to terminate the current path
+            sim_run = \
+                simuvex.procedures.SimProcedures["stubs"]["PathTerminator"](
+                    state, addr=addr)
+        except simuvex.SimError as ex:
+            l.error("SimError: ", exc_info=True)
+
+            error_occured = True
+            # Generate a PathTerminator to terminate the current path
+            sim_run = \
+                simuvex.procedures.SimProcedures["stubs"]["PathTerminator"](
+                    state, addr=addr)
+        except AngrError as ex:
+            #segment = self.project.loader.main_bin.in_which_segment(addr)
+            l.error("AngrError %s when creating SimRun at 0x%x",
+                    ex, addr)
+            # We might be on a wrong branch, and is likely to encounter the
+            # "No bytes in memory xxx" exception
+            # Just ignore it
+            error_occured = True
+            sim_run = None
+
+        return sim_run, error_occured, restart_analysis
+
+    def _remove_pending_return(self, entry_wrapper, pending_returns):
+        """
+        Remove all pending returns that are related to the current entry.
+        """
+
+        # Build the tuples that we want to remove from the dict fake_func_retn_exits
+        tpls_to_remove = [ ]
+        call_stack_copy = entry_wrapper.call_stack_copy()
+        while call_stack_copy.get_ret_target() is not None:
+            ret_target = call_stack_copy.get_ret_target()
+            # Remove the current call stack frame
+            call_stack_copy.ret(ret_target)
+            call_stack_suffix = call_stack_copy.stack_suffix(self._context_sensitivity_level)
+            tpl = call_stack_suffix + (ret_target,)
+            tpls_to_remove.append(tpl)
+
+        # Remove those tuples from the dict
+        for tpl in tpls_to_remove:
+            if tpl in pending_returns:
+                del pending_returns[tpl]
+                l.debug("Removed (%s) from FakeExits dict.",
+                        ",".join([hex(i) if i is not None else 'None' for i in tpl]))
+
+    def _is_call_jump(self, jumpkind):
+        if jumpkind == 'Ijk_Call' or jumpkind.startswith('Ijk_Sys_'):
+            return True
+        return False
+
+    def _worklist_append_entry(self, exit_wrapper):
+        """
+        Append a new entry into the work-list.
+
+        :param exit_wrapper: The wrapper to insert into the work list.
+        :return: None
+        """
+
+        def get_simrun_key(ew):
+            sk = ew.call_stack_suffix() + (ew.path.addr, 'syscall' if ew.jumpkind.startswith('Ijk_Sys') else 'normal')
+            return sk
+
+        simrun_key = get_simrun_key(exit_wrapper)
+
+        node = self._cfg.get_node(simrun_key)
+
+        if node is None:
+            if None in simrun_key:
+                # Since we may not start analysis from entry point of the binary, the simrun_key usually doesn't
+                # include the callee of this current function. Here we try to guess the closest SimRun key, and get the
+                # corresponding CFG node.
+                first_concrete_pos = next(i for i in xrange(len(simrun_key)) if simrun_key[i] is not None)
+                for key in self._cfg._nodes.keys():
+                    if key[ first_concrete_pos : ] == simrun_key[ first_concrete_pos : ]:
+                        node = self._cfg.get_node(key)
+                        break
+
+        if node is None:
+            result = "Appended [not in CFG]"
+            self._worklist.append(exit_wrapper)
+
+        else:
+            worklist_orders = [ self._cfg.get_topological_order(self._cfg.get_node(get_simrun_key(ew))) for ew in self._worklist ] # It's already ordered
+            order_new = self._cfg.get_topological_order(node)
+
+            pos = bisect.bisect_left(worklist_orders, order_new)
+            if len(worklist_orders) > pos and worklist_orders[pos] == order_new:
+                # It already exists. Skip it
+                result = 'Skipped [in CFG]'
+
+            else:
+                self._worklist.insert(pos, exit_wrapper)
+                result = "Inserted at %d [in CFG]" % pos
+
+        return result
+
+    def _worklist_pop_entry(self):
+        """
+        Pop an existing entry from the worklist.
+        We always pop the entry based on the quasi-topological order in the recovered CFG to reduce iterations.
+
+        :return: A popped ExitWrapper, or None if the work-list is empty.
+        """
+
+        elem = self._worklist[0]
+        self._worklist = self._worklist[ 1 : ]
+        return elem
+
     def _create_stack_region(self, successor_state, successor_ip):
         reg_sp_offset = successor_state.arch.sp_offset
         reg_sp_expr = successor_state.registers.load(reg_sp_offset)
 
-        if type(reg_sp_expr.model) is claripy.BVV:
+        if type(reg_sp_expr._model_vsa) is claripy.BVV:
             reg_sp_val = successor_state.se.any_int(reg_sp_expr)
             reg_sp_si = successor_state.se.SI(to_conv=reg_sp_expr)
-            reg_sp_si = reg_sp_si.model
-        elif type(reg_sp_expr.model) in (int, long):
-            reg_sp_val = reg_sp_expr.model
+            reg_sp_si = reg_sp_si._model_vsa
+        elif type(reg_sp_expr._model_vsa) in (int, long):
+            reg_sp_val = reg_sp_expr._model_vsa
             reg_sp_si = successor_state.se.SI(bits=successor_state.arch.bits, to_conv=reg_sp_val)
-            reg_sp_si = reg_sp_si.model
-        elif type(reg_sp_expr.model) is claripy.vsa.StridedInterval:
-            reg_sp_si = reg_sp_expr.model
+            reg_sp_si = reg_sp_si._model_vsa
+        elif type(reg_sp_expr._model_vsa) is claripy.vsa.StridedInterval:
+            reg_sp_si = reg_sp_expr._model_vsa
             reg_sp_val = reg_sp_si.min
         else:
-            reg_sp_si = reg_sp_expr.model.items()[0][1]
+            reg_sp_si = reg_sp_expr._model_vsa.items()[0][1]
             reg_sp_val = reg_sp_si.min
 
         reg_sp_val = reg_sp_val - successor_state.arch.bits / 8  # TODO: Is it OK?
@@ -1100,21 +1205,21 @@ class VFG(Analysis):
             addrs = [ addrs ]
 
         for addr in addrs:
-            if expr.model.name not in self._uninitialized_access:
-                self._uninitialized_access[expr.model.name] = (bbl_addr, stmt_idx, mem_id, addr, length)
+            if expr._model_vsa.name not in self._uninitialized_access:
+                self._uninitialized_access[expr._model_vsa.name] = (bbl_addr, stmt_idx, mem_id, addr, length)
 
     def _find_innermost_uninitialized_expr(self, expr):
         result = [ ]
 
         if not expr.args:
-            if hasattr(expr.model, 'uninitialized') and expr.model.uninitialized:
+            if hasattr(expr._model_vsa, 'uninitialized') and expr._model_vsa.uninitialized:
                 result.append(expr)
 
         else:
             tmp_result = [ ]
 
             for a in expr.args:
-                if isinstance(a, claripy.Base):
+                if isinstance(a, claripy.ast.Base):
                     r = self._find_innermost_uninitialized_expr(a)
 
                     if r:
@@ -1124,8 +1229,8 @@ class VFG(Analysis):
                 result = tmp_result
 
             elif not tmp_result and \
-                    hasattr(expr.model, 'uninitialized') and \
-                    expr.model.uninitialized:
+                    hasattr(expr._model_vsa, 'uninitialized') and \
+                    expr._model_vsa.uninitialized:
                 result.append(expr)
 
         return result
@@ -1137,7 +1242,7 @@ class VFG(Analysis):
         next_expr_type = expr_type
 
         for ex in expr:
-            name = ex.model.name
+            name = ex._model_vsa.name
 
             if name in self._uninitialized_access:
                 bbl_addr, stmt_idx, mem_id, addr, length = self._uninitialized_access[name]
@@ -1150,7 +1255,10 @@ class VFG(Analysis):
                 if next_expr_type == 'addr':
                     next_expr_type = 'value'
             else:
-                raise Exception('TODO: Please report it to Fish')
+                l.error('Variable %s does not exist in self._uninitialized_access. Please report it to Fish.', name)
+                return False
+
+        return True
 
     def _initialize_state(self, state):
 
@@ -1191,20 +1299,6 @@ class VFG(Analysis):
         else:
             raise Exception("Unsupported block type %s" % type(b))
 
-    def get_any_node(self, addr):
-        """
-        Get any VFG node corresponding to the basic block at @addr.
-        Note that depending on the context sensitivity level, there might be
-        multiple nodes corresponding to different contexts. This function will
-        return the first one it encounters, which might not be what you want.
-        """
-        for n in self.graph.nodes():
-            if n.addr == addr:
-                return n
-
-    def irsb_from_node(self, node):
-        return self.project.factory.sim_run(node.state, addr=node.addr)
-
     def _get_nx_paths(self, begin, end):
         """
         Get the possible (networkx) simple paths between two nodes or addresses
@@ -1223,17 +1317,5 @@ class VFG(Analysis):
             raise AngrVFGError("from and to should be of the same type")
 
         return networkx.all_simple_paths(self.graph, n_begin, n_end)
-
-    def get_paths(self, begin, end):
-        """
-        Get all the simple paths between @begin and @end.
-        Returns: a list of angr.Path instances.
-        """
-        paths = self._get_nx_paths(begin, end)
-        a_paths = []
-        for p in paths:
-            runs = map(self.irsb_from_node, p)
-            a_paths.append(angr.path.make_path(self.project, runs))
-            return a_paths
 
 register_analysis(VFG, 'VFG')

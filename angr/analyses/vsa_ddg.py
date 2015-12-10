@@ -249,7 +249,7 @@ class VSA_DDG(Analysis):
             if a.bbl_addr is None:
                 current_code_loc = CodeLocation(None, None, sim_procedure=a.sim_procedure)
             else:
-                current_code_loc = CodeLocation(a.bbl_addr, a.stmt_idx)
+                current_code_loc = CodeLocation(a.bbl_addr, a.stmt_idx, ins_addr=a.ins_addr)
 
             if a.type == "mem":
                 if a.actual_addrs is None:
@@ -289,7 +289,8 @@ class VSA_DDG(Analysis):
                 # For now, we assume a.offset is not symbolic
                 # TODO: Support symbolic register offsets
 
-                variable = SimRegisterVariable(a.offset, a.data.ast.size())
+                #variable = SimRegisterVariable(a.offset, a.data.ast.size())
+                variable = SimRegisterVariable(a.offset, self.project.arch.bits)
 
                 if a.action == 'read':
                     # What do we want to do?
