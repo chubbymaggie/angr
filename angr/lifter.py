@@ -1,3 +1,4 @@
+import logging
 import sys
 import pyvex
 import simuvex
@@ -5,36 +6,38 @@ from archinfo import ArchARM
 
 import capstone
 
-import logging
 l = logging.getLogger("angr.lifter")
 
 VEX_IRSB_MAX_SIZE = 400
 VEX_IRSB_MAX_INST = 99
 VEX_DEFAULT_OPT_LEVEL = 1
 
-class Lifter:
+
+class Lifter(object):
     def __init__(self, project, cache=False):
         self._project = project
         self._thumbable = isinstance(project.arch, ArchARM)
         self._cache_enabled = cache
-        self._block_cache = { }
+        self._block_cache = {}
 
     def lift(self, addr, arch=None, insn_bytes=None, max_size=None, num_inst=None,
              traceflags=0, thumb=False, backup_state=None, opt_level=None):
         """
-        Returns a pyvex block starting at address addr
+        Returns a pyvex block starting at address `addr`.
 
-        @param addr: the address at which to start the block
+        :param addr:    The address at which to start the block.
 
-        The below parameters are optional:
-        @param thumb: whether the block should be lifted in ARM's THUMB mode
-        @param backup_state: a state to read bytes from instead of using project memory
-        @param opt_level: the VEX optimization level to use
-        @param insn_bytes: a string of bytes to use for the block instead of the project
-        @param max_size: the maximum size of the block, in bytes
-        @param num_inst: the maximum number of instructions
-        @param traceflags: traceflags to be passed to VEX. Default: 0
+        The following parameters are optional:
+
+        :param thumb:           Whether the block should be lifted in ARM's THUMB mode.
+        :param backup_state:    A state to read bytes from instead of using project memory.
+        :param opt_level:       The VEX optimization level to use.
+        :param insn_bytes:      A string of bytes to use for the block instead of the project.
+        :param max_size:        The maximum size of the block, in bytes.
+        :param num_inst:        The maximum number of instructions.
+        :param traceflags:      traceflags to be passed to VEX. (default: 0)
         """
+
         passed_max_size = max_size is not None
         passed_num_inst = num_inst is not None
         max_size = VEX_IRSB_MAX_SIZE if max_size is None else max_size
@@ -135,7 +138,8 @@ class Lifter:
                     continue
                 if self._project.is_hooked(stmt.addr):
                     size = stmt.addr - real_addr
-                    irsb = pyvex.IRSB(bytes=buff, mem_addr=addr, num_bytes=size, arch=arch, bytes_offset=byte_offset, traceflags=traceflags)
+                    irsb = pyvex.IRSB(bytes=buff, mem_addr=addr, num_bytes=size, arch=arch, bytes_offset=byte_offset,
+                                      traceflags=traceflags)
                     break
 
         irsb = self._post_process(irsb)
@@ -146,7 +150,7 @@ class Lifter:
 
     @staticmethod
     def _bytes_from_state(backup_state, addr, max_size):
-        arr = [ ]
+        arr = []
 
         for i in range(addr, addr + max_size):
             if i in backup_state.memory:
@@ -167,13 +171,14 @@ class Lifter:
         return buff, size
 
     def _post_process(self, block):
-        '''
+        """
         Do some post-processing work here.
+
         :param block:
         :return:
-        '''
+        """
 
-        block.statements = [ x for x in block.statements if x.tag != 'Ist_NoOp' ]
+        block.statements = [x for x in block.statements if x.tag != 'Ist_NoOp']
 
         funcname = "_post_process_%s" % self._project.arch.name
         if hasattr(self, funcname):
@@ -207,6 +212,7 @@ class Lifter:
                 block.jumpkind = "Ijk_Call"
 
         return block
+
     _post_process_ARMEL = _post_process_ARM
     _post_process_ARMHF = _post_process_ARM
 
@@ -243,21 +249,22 @@ class Lifter:
             else:
                 # Looking for the WrTmp statement
                 if isinstance(stmt, pyvex.IRStmt.WrTmp) and \
-                    stmt.tmp == tmp_exit:
+                                stmt.tmp == tmp_exit:
                     if isinstance(stmt.data, pyvex.IRExpr.Binop) and \
-                            stmt.data.op == 'Iop_CmpEQ32' and \
+                                    stmt.data.op == 'Iop_CmpEQ32' and \
                             isinstance(stmt.data.child_expressions[0], pyvex.IRExpr.Const) and \
                             isinstance(stmt.data.child_expressions[1], pyvex.IRExpr.Const) and \
-                            stmt.data.child_expressions[0].con.value == stmt.data.child_expressions[1].con.value:
+                                    stmt.data.child_expressions[0].con.value == stmt.data.child_expressions[
+                                1].con.value:
 
                         # Create a new IRConst
-                        irconst = pyvex.IRExpr.Const.__new__()      # XXX: does this work???
+                        irconst = pyvex.IRExpr.Const.__new__()  # XXX: does this work???
                         irconst.con = dst
                         irconst.is_atomic = True
                         irconst.result_type = dst.type
                         irconst.tag = 'Iex_Const'
 
-                        block.statements = block.statements[ : exit_stmt_idx] + block.statements[exit_stmt_idx + 1 : ]
+                        block.statements = block.statements[: exit_stmt_idx] + block.statements[exit_stmt_idx + 1:]
                         # Replace the default exit!
                         block.next = irconst
 
@@ -278,7 +285,7 @@ class Lifter:
         temps = set()
         src_stmt_ids = set()
 
-        if not isinstance(statements[put_stmt_id],pyvex.IRStmt.Put):
+        if not isinstance(statements[put_stmt_id], pyvex.IRStmt.Put):
             return None
 
         if not isinstance(statements[put_stmt_id].data, pyvex.IRExpr.RdTmp):
@@ -299,6 +306,7 @@ class Lifter:
                     temps.remove(stmt.tmp)
 
         return src_stmt_ids
+
 
 class Block(object):
     def __init__(self, byte_string, vex, thumb):
@@ -333,6 +341,17 @@ class Block(object):
     def __setstate__(self, data):
         self.__dict__.update(data)
 
+    def __hash__(self):
+        return hash((type(self), self.addr, self.bytes))
+
+    def __eq__(self, other):
+        return type(self) is type(other) and \
+               self.addr == other.addr and \
+               self.bytes == other.bytes
+
+    def __ne__(self, other):
+        return not self == other
+
     def pp(self):
         return self.capstone.pp()
 
@@ -358,16 +377,22 @@ class Block(object):
         self._capstone = block
         return block
 
-class CopyClass:
+    @property
+    def codenode(self):
+        return BlockNode(self.addr, self.size, bytestr=self.bytes)
+
+
+class CopyClass(object):
     def __init__(self, obj):
         for attr in dir(obj):
             if attr.startswith('_'):
                 continue
             val = getattr(obj, attr)
-            if type(val) in (int, long, list, tuple, str, dict, float): # pylint: disable=unidiomatic-typecheck
+            if type(val) in (int, long, list, tuple, str, dict, float):  # pylint: disable=unidiomatic-typecheck
                 setattr(self, attr, val)
             else:
                 setattr(self, attr, CopyClass(val))
+
 
 class CapstoneInsn(object):
     def __init__(self, insn):
@@ -400,6 +425,7 @@ class CapstoneInsn(object):
     def __repr__(self):
         return '<CapstoneInsn "%s" for %#x>' % (self.mnemonic, self.address)
 
+
 class CapstoneBlock(object):
     def __init__(self, addr, insns, thumb, arch):
         self.addr = addr
@@ -418,3 +444,4 @@ class CapstoneBlock(object):
 
 
 from .errors import AngrMemoryError, AngrTranslationError
+from .knowledge.codenode import BlockNode

@@ -1,11 +1,15 @@
 angr
 ====
 
+[![Latest Release](https://img.shields.io/pypi/v/angr.svg)](https://pypi.python.org/pypi/angr/)
+[![PyPI](https://img.shields.io/pypi/dm/angr.svg)](https://pypi.python.org/pypi/angr/)
+[![License](https://img.shields.io/github/license/angr/angr.svg)](https://github.com/angr/angr/blob/master/LICENSE)
+
 angr is a platform-agnostic binary analysis framework developed by the Computer Security Lab at UC Santa Barbara and their associated CTF team, Shellphish.
 
 # What?
 
-Angr is a suite of python libraries that let you load a binary and do a lot of cool things to it:
+angr is a suite of python libraries that let you load a binary and do a lot of cool things to it:
 
 - Disassembly and intermediate-representation lifting
 - Program instrumentation
@@ -94,10 +98,10 @@ Synchronization of files in and out of docker is left as an excercize to the use
 # Troubleshooting
 
 ## libgomp.so.1: version `GOMP_4.0' not found
-This error represents an incompatibility between the pre-compiled version of `angr-z3` and the installed version of `libgomp`. A Z3 recompile is required. You can do this by executing:
+This error represents an incompatibility between the pre-compiled version of `angr-only-z3-custom` and the installed version of `libgomp`. A Z3 recompile is required. You can do this by executing:
 
 ```bash
-pip install -I --no-use-wheel angr-z3
+pip install -I --no-use-wheel angr-only-z3-custom
 ```
 
 ## Can't import mulpyplexer
@@ -122,13 +126,13 @@ no reason, saying that it can't create some object file because some file or
 directory doesn't exist. Just retry the build:
 
 ```bash
-pip install -I --no-use-wheel angr-z3
+pip install -I --no-use-wheel angr-only-z3-custom
 ```
 
 ## Claripy and z3 on Windows
 Z3 might compile on windows if you have a l33t enough build environment. If
 this isn't the case for you, you should download a wheel from somewhere on the
-internet. I found one once, but can't seem to find it again while writing this.
+internet. One location for pre-built Windows wheel files is <https://github.com/Owlz/angr-Windows>.
 
 If you build z3 from source, make sure you're using the unstable branch of z3,
 which includes floating point support. In addition, make sure to have

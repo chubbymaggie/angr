@@ -5,6 +5,9 @@ from ..errors import AngrCFGError
 l = logging.getLogger(name="angr.cfg_base")
 
 class CFGBase(object):
+    """
+    The base class for control flow graphs.
+    """
     def __init__(self, project, context_sensitivity_level):
         self._project = project
 
@@ -14,7 +17,6 @@ class CFGBase(object):
         self._edge_map = None
         self._loop_back_edges = None
         self._overlapped_loop_headers = None
-        self._function_manager = None
         self._thumb_addrs = set()
         if context_sensitivity_level < 0:
             raise Exception("Unsupported context sensitivity level %d" % context_sensitivity_level)
@@ -28,9 +30,9 @@ class CFGBase(object):
         return self._context_sensitivity_level
 
     def _initialize_cfg(self):
-        '''
+        """
         Re-create the DiGraph
-        '''
+        """
         self._graph = networkx.DiGraph()
 
     # pylint: disable=no-self-use
@@ -143,17 +145,17 @@ class CFGBase(object):
         return self._project.factory.sim_run(cfg_node.input_state)
 
     def irsb_from_node(self, cfg_node):
-        '''
+        """
         Create SimRun from a CFGNode object.
-        '''
+        """
         return self._get_irsb(cfg_node)
 
     def get_any_irsb(self, addr):
-        '''
+        """
         Returns a SimRun of a certain address. If there are many SimRuns with the same address in CFG,
         return an arbitrary one.
         You should never assume this method returns a specific one.
-        '''
+        """
         cfg_node = self.get_any_node(addr)
 
         return self._get_irsb(cfg_node)
@@ -179,9 +181,9 @@ class CFGBase(object):
         return results
 
     def get_all_irsbs(self, addr):
-        '''
+        """
         Returns all SimRuns of a certain address, without considering contexts.
-        '''
+        """
 
         nodes = self.get_all_nodes(addr)
 
@@ -202,9 +204,9 @@ class CFGBase(object):
         return irsb_addr_set
 
     def get_branching_nodes(self):
-        '''
+        """
         Returns all nodes that has an out degree >= 2
-        '''
+        """
         nodes = set()
         for n in self._graph.nodes():
             if self._graph.out_degree(n) >= 2:
@@ -234,10 +236,6 @@ class CFGBase(object):
 
         if edge in self._graph:
             self._graph.remove_edge(edge)
-
-    @property
-    def function_manager(self):
-        return self._function_manager
 
     def is_thumb_addr(self, addr):
         return addr in self._thumb_addrs

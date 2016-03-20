@@ -286,7 +286,7 @@ class CFGFast(Analysis):
         self._resolve_indirect_jumps = resolve_indirect_jumps
         self._force_segment = force_segment
 
-        l.debug("Starts at 0x%08x and ends at 0x%08x.", self._start, self._end)
+        l.debug("Starts at %#x and ends at %#x.", self._start, self._end)
 
         # Get all valid memory regions
         self._valid_memory_regions = self._executable_memory_regions()
@@ -306,20 +306,8 @@ class CFGFast(Analysis):
         # All IRSBs with an indirect exit target
         self._indirect_jumps = set()
 
-        self.function_manager = FunctionManager(self.project, self)
-
         # Start working!
         self._analyze()
-
-    #
-    # Properties
-    #
-
-    def call_map(self):
-
-        # TODO: Get the call map from self.function_manager
-
-        raise NotImplementedError()
 
     #
     # Utils
@@ -347,6 +335,13 @@ class CFGFast(Analysis):
             if p_x > 0:
                 entropy += - p_x * math.log(p_x, 2)
         return entropy
+
+    #
+    # Public methods
+    #
+    @property
+    def functions(self):
+        return self.kb.functions
 
     #
     # Private methods
@@ -552,7 +547,7 @@ class CFGFast(Analysis):
 
         unassured_functions = []
 
-        for start_, end_, bytes_ in strides:
+        for start_, _, bytes_ in strides:
             for regex in regexes:
                 # Match them!
                 for mo in regex.finditer(bytes_):
@@ -565,7 +560,7 @@ class CFGFast(Analysis):
 
     # Basic block scanning
 
-    def _scan_code(self, traced_addresses, function_exits, initial_state, starting_address, maybe_function):
+    def _scan_code(self, traced_addresses, function_exits, initial_state, starting_address, maybe_function): #pylint:disable=unused-argument
         # Saving tuples like (current_function_addr, next_exit_addr)
         # Current_function_addr == -1 for exits not inside any function
         remaining_entries = set()
@@ -574,10 +569,6 @@ class CFGFast(Analysis):
         # Initialize the remaining_entries set
         ce = CFGEntry(next_addr, next_addr, 'Ijk_Boring', last_addr=None)
         remaining_entries.add(ce)
-
-        if maybe_function:
-            # Add it to function manager
-            self.function_manager._create_function_if_not_exist(next_addr)
 
         while len(remaining_entries):
             ce = remaining_entries.pop()
@@ -605,8 +596,7 @@ class CFGFast(Analysis):
             self._scan_block(addr, current_function_addr, function_exits, remaining_entries, traced_addresses,
                              jumpkind, src_node)
 
-    def _scan_block(self, addr, current_function_addr, function_exits, remaining_entries, traced_addresses,
-                    previous_jumpkind, previous_src_node):
+    def _scan_block(self, addr, current_function_addr, function_exits, remaining_entries, traced_addresses, previous_jumpkind, previous_src_node): #pylint:disable=unused-argument
         """
         Scan a basic block starting at a specific address
 
@@ -661,13 +651,12 @@ class CFGFast(Analysis):
 
             elif jumpkind == 'Ijk_Call':
                 if next_addr is not None:
-                    self.function_manager._create_function_if_not_exist(next_addr)
 
                     new_function_addr = next_addr
                     return_site = addr + irsb.size  # We assume the program will always return to the succeeding position
 
                     if current_function_addr != -1:
-                        self.function_manager.call_to(
+                        self.kb.functions._add_call_to(
                             current_function_addr,
                             addr,
                             next_addr,
@@ -747,7 +736,7 @@ class CFGFast(Analysis):
                 annotatedcfg = AnnotatedCFG(self.project, None, detect_loops=False)
                 annotatedcfg.from_digraph(b.slice)
 
-                for src_irsb, src_stmt_idx in sources:
+                for src_irsb, _ in sources:
                     # Use slicecutor to execute each one, and get the address
                     # We simply give up if any exception occurs on the way
 
@@ -785,6 +774,42 @@ class CFGFast(Analysis):
                                 l.info("Found a function address %x", concrete_ip)
 
         return function_starts
+
+    def _remove_overlapping_blocks(self):
+        """
+        On X86 and AMD64 there are sometimes garbage bytes (usually nops) between functions in order to properly
+        align the succeeding function. CFGFast does a linear sweeping which might create duplicated blocks for
+        function epilogues where one block starts before the garbage bytes and the other starts after the garbage bytes.
+
+        This method enumerates all blocks and remove overlapping blocks if one of them is aligned to 0x10 and the other
+        contains only garbage bytes.
+
+        :return: None
+        """
+
+        sorted_nodes = sorted(self.graph.nodes(), key=lambda n: n.addr if n is not None else 0)
+
+        for i in xrange(len(sorted_nodes) - 1):
+            a, b = sorted_nodes[i], sorted_nodes[i + 1]
+
+            if a is None or b is None:
+                continue
+
+            if a.addr <= b.addr and \
+                    (a.addr + a.size > b.addr):
+                # They are overlapping
+                if b.addr in self.kb.functions and (b.addr - a.addr < 0x10) and b.addr % 0x10 == 0:
+                    # b is the beginning of a function
+                    # a should be removed
+                    self.graph.remove_node(a)
+                else:
+                    try:
+                        block = self.project.factory.block(a.addr, max_size=b.addr-a.addr)
+                    except AngrTranslationError:
+                        continue
+                    if len(block.capstone.insns) == 1 and block.capstone.insns[0].insn_name() == "nop":
+                        # It's a big nop
+                        self.graph.remove_node(a)
 
     def _analyze(self):
         """
@@ -871,28 +896,15 @@ class CFGFast(Analysis):
             self._scan_code(traced_address, function_exits, initial_state, next_addr, maybe_function)
 
         pb.finish()
+
+        self._remove_overlapping_blocks()
+
         end_time = datetime.now()
-        l.info("A full code scan takes %d seconds.", (end_time - start_time).seconds)
+        l.info("Generating CFGFast takes %d seconds.", (end_time - start_time).seconds)
 
     #
     # Public methods
     #
-
-    def genenare_callmap_sif(self, filepath):
-        """
-        Generate a sif file from the call map
-
-        :param filepath: Path of the sif file
-        :return: None
-        """
-        graph = self.call_map  # FIXME: get call map from self.function_manager
-
-        if graph is None:
-            raise AngrGirlScoutError('Please generate the call graph first.')
-
-        with open(filepath, "wb") as f:
-            for src, dst in graph.edges():
-                f.write("0x%x\tDirectEdge\t0x%x\n" % (src, dst))
 
     def generate_code_cover(self):
         """
@@ -909,12 +921,10 @@ class CFGFast(Analysis):
             lst.append((irsb_addr, irsb_size))
 
         lst = sorted(lst, key=lambda x: x[0])
-
         return lst
 
 register_analysis(CFGFast, 'CFGFast')
 
 from .cfg_node import CFGNode
 from ..blade import Blade
-from ..errors import AngrGirlScoutError, AngrTranslationError, AngrMemoryError
-from ..functionmanager import FunctionManager
+from ..errors import AngrTranslationError, AngrMemoryError

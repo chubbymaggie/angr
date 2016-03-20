@@ -1,4 +1,4 @@
-from ..errors import AngrMemoryError
+from ..errors import AngrMemoryError, AngrTranslationError
 from ..analysis import Analysis, register_analysis
 
 from collections import deque
@@ -41,9 +41,9 @@ class ConstantChange(object):
 # helper methods
 def _euclidean_dist(vector_a, vector_b):
     """
-    :param vector_a: list of numbers
-    :param vector_b: list of numbers
-    :return: the euclidean distance between the two vectors
+    :param vector_a:    A list of numbers.
+    :param vector_b:    A list of numbers.
+    :returns:           The euclidean distance between the two vectors.
     """
     dist = 0
     for (x, y) in zip(vector_a, vector_b):
@@ -53,9 +53,10 @@ def _euclidean_dist(vector_a, vector_b):
 
 def _get_closest_matches(input_attributes, target_attributes):
     """
-    :param input_attributes: first dictionary of objects to attribute tuples
-    :param target_attributes: second dictionary of blocks to attribute tuples
-    :return: dictionary of objects in the input_attributes to the closest objects in the target_attributes
+    :param input_attributes:    First dictionary of objects to attribute tuples.
+    :param target_attributes:   Second dictionary of blocks to attribute tuples.
+    :returns:                   A dictionary of objects in the input_attributes to the closest objects in the
+                                target_attributes.
     """
     closest_matches = {}
 
@@ -78,9 +79,9 @@ def _get_closest_matches(input_attributes, target_attributes):
 # from http://rosettacode.org/wiki/Levenshtein_distance
 def _levenshtein_distance(s1, s2):
     """
-    :param s1: A list or string
-    :param s2: Another list or string
-    :return: The levenshtein distance between the two
+    :param s1:  A list or string
+    :param s2:  Another list or string
+    :returns:    The levenshtein distance between the two
     """
     if len(s1) > len(s2):
         s1, s2 = s2, s1
@@ -102,10 +103,11 @@ def _normalized_levenshtein_distance(s1, s2, acceptable_differences):
     """
     This function calculates the levenshtein distance but allows for elements in the lists to be different by any number
     in the set acceptable_differences.
-    :param s1: A list
-    :param s2: Another list
-    :param acceptable_differences: A set of numbers. If (s2[i]-s1[i]) is in the set then they are considered equal
-    :return:
+
+    :param s1:                      A list.
+    :param s2:                      Another list.
+    :param acceptable_differences:  A set of numbers. If (s2[i]-s1[i]) is in the set then they are considered equal.
+    :returns:
     """
     if len(s1) > len(s2):
         s1, s2 = s2, s1
@@ -126,13 +128,13 @@ def _normalized_levenshtein_distance(s1, s2, acceptable_differences):
 
 def _is_better_match(x, y, matched_a, matched_b, attributes_dict_a, attributes_dict_b):
     """
-    :param x: the first element of a possible match
-    :param y: the second element of a possible match
-    :param matched_a: the current matches for the first set
-    :param matched_b: the current matches for the second set
-    :param attributes_dict_a: the attributes for each element in the first set
-    :param attributes_dict_b: the attributes for each element in the second set
-    :return:
+    :param x:                   The first element of a possible match.
+    :param y:                   The second element of a possible match.
+    :param matched_a:           The current matches for the first set.
+    :param matched_b:           The current matches for the second set.
+    :param attributes_dict_a:   The attributes for each element in the first set.
+    :param attributes_dict_b:   The attributes for each element in the second set.
+    :returns:                   True/False
     """
     attributes_x = attributes_dict_a[x]
     attributes_y = attributes_dict_b[y]
@@ -149,11 +151,12 @@ def _is_better_match(x, y, matched_a, matched_b, attributes_dict_a, attributes_d
 
 def differing_constants(block_a, block_b):
     """
-    Compares two basic blocks and finds all the constants that differ from the first block to the second
-    :param block_a: the first block to compare
-    :param block_b: the second block to compare
-    :return: returns a list of differing constants in the form of ConstantChange, which has the offset in the block
-             and the respective constants.
+    Compares two basic blocks and finds all the constants that differ from the first block to the second.
+
+    :param block_a: The first block to compare.
+    :param block_b: The second block to compare.
+    :returns:       Returns a list of differing constants in the form of ConstantChange, which has the offset in the
+                    block and the respective constants.
     """
     statements_a = [s for s in block_a.vex.statements if s.tag != "Ist_IMark"] + [block_a.vex.next]
     statements_b = [s for s in block_b.vex.statements if s.tag != "Ist_IMark"] + [block_b.vex.next]
@@ -201,7 +204,9 @@ def compare_statement_dict(statement_1, statement_2):
 
     # constants
     if isinstance(statement_1, (int, long, float, str)):
-        if statement_1 == statement_2:
+        if isinstance(statement_1, float) and math.isnan(statement_1) and math.isnan(statement_2):
+            return []
+        elif statement_1 == statement_2:
             return []
         else:
             return [Difference(None, statement_1, statement_2)]
@@ -239,13 +244,13 @@ def compare_statement_dict(statement_1, statement_2):
 
 class NormalizedBlock(object):
     # block may span multiple calls
-    def __init__(self, addr, function):
-        addresses = [addr]
-        if addr in function.merged_blocks:
-            for a in function.merged_blocks[addr]:
-                addresses.append(a)
+    def __init__(self, block, function):
+        addresses = [block.addr]
+        if block.addr in function.merged_blocks:
+            for a in function.merged_blocks[block.addr]:
+                addresses.append(a.addr)
 
-        self.addr = addr
+        self.addr = block.addr
         self.addresses = addresses
         self.statements = []
         self.all_constants = []
@@ -254,8 +259,8 @@ class NormalizedBlock(object):
         self.blocks = []
         self.instruction_addrs = []
 
-        if addr in function.call_sites:
-            self.call_targets = function.call_sites[addr]
+        if block.addr in function.call_sites:
+            self.call_targets = function.call_sites[block.addr]
 
         self.jumpkind = None
 
@@ -280,8 +285,8 @@ class NormalizedFunction(object):
     # a more normalized function
     def __init__(self, function):
         # start by copying the graph
-        self.graph = function.local_transition_graph.copy()
-        self.project = function._function_manager.project
+        self.graph = function.graph.copy()
+        self.project = function._function_manager._kb._project
         self.call_sites = dict()
         self.startpoint = function.startpoint
         self.merged_blocks = dict()
@@ -293,13 +298,15 @@ class NormalizedFunction(object):
             done = True
             for node in self.graph.nodes():
                 try:
-                    bl = self.project.factory.block(node)
+                    bl = self.project.factory.block(node.addr)
                 except AngrMemoryError:
                     continue
-                # merge if it ends with a single call, and the successor has only one predecessor
+                except AngrTranslationError:
+                    continue
+                # merge if it ends with a single call, and the successor has only one predecessor and succ is after
                 successors = self.graph.successors(node)
                 if bl.vex.jumpkind == "Ijk_Call" and len(successors) == 1 and \
-                        len(self.graph.predecessors(successors[0])) == 1:
+                        len(self.graph.predecessors(successors[0])) == 1 and successors[0].addr > node.addr:
                     # add edges to the successors of its successor, and delete the original successors
                     succ = self.graph.successors(node)[0]
                     for s in self.graph.successors(succ):
@@ -321,25 +328,25 @@ class NormalizedFunction(object):
         # set up call sites
         for n in self.graph.nodes():
             call_targets = []
-            if n in self.orig_function.get_call_sites():
-                call_targets.append(self.orig_function.get_call_target(n))
-            if n in self.merged_blocks:
+            if n.addr in self.orig_function.get_call_sites():
+                call_targets.append(self.orig_function.get_call_target(n.addr))
+            if n.addr in self.merged_blocks:
                 for block in self.merged_blocks[n]:
-                    if block in self.orig_function.get_call_sites():
-                        call_targets.append(self.orig_function.get_call_target(block))
+                    if block.addr in self.orig_function.get_call_sites():
+                        call_targets.append(self.orig_function.get_call_target(block.addr))
             if len(call_targets) > 0:
                 self.call_sites[n] = call_targets
 
 
 class FunctionDiff(object):
     """
-    This class computes the a diff between two functions
+    This class computes the a diff between two functions.
     """
     def __init__(self, function_a, function_b, bindiff=None):
         """
-        :param function_a: The first angr Function object to diff
-        :param function_b: The second angr Function object
-        :param bindiff: An optional Bindiff object. Used for some extra normalization during basic block comparison
+        :param function_a: The first angr Function object to diff.
+        :param function_b: The second angr Function object.
+        :param bindiff:    An optional Bindiff object. Used for some extra normalization during basic block comparison.
         """
         self._function_a = NormalizedFunction(function_a)
         self._function_b = NormalizedFunction(function_b)
@@ -359,7 +366,7 @@ class FunctionDiff(object):
     @property
     def probably_identical(self):
         """
-        :return: Whether or not these two functions are identical.
+        :returns: Whether or not these two functions are identical.
         """
         if len(self._unmatched_blocks_from_a | self._unmatched_blocks_from_b) > 0:
             return False
@@ -371,7 +378,7 @@ class FunctionDiff(object):
     @property
     def identical_blocks(self):
         """
-        :return: A list of block matches which appear to be identical
+        :returns: A list of block matches which appear to be identical
         """
         identical_blocks = []
         for (block_a, block_b) in self._block_matches:
@@ -382,13 +389,30 @@ class FunctionDiff(object):
     @property
     def differing_blocks(self):
         """
-        :return: A list of block matches which appear to differ
+        :returns: A list of block matches which appear to differ
         """
         differing_blocks = []
         for (block_a, block_b) in self._block_matches:
             if not self.blocks_probably_identical(block_a, block_b):
                 differing_blocks.append((block_a, block_b))
         return differing_blocks
+
+    @property
+    def blocks_with_differing_constants(self):
+        """
+        :return: A list of block matches which appear to differ
+        """
+        differing_blocks = []
+        diffs = dict()
+        for (block_a, block_b) in self._block_matches:
+            if self.blocks_probably_identical(block_a, block_b) and \
+                    not self.blocks_probably_identical(block_a, block_b, check_constants=True):
+                differing_blocks.append((block_a, block_b))
+        for block_a, block_b in differing_blocks:
+            ba = NormalizedBlock(block_a, self._function_a)
+            bb = NormalizedBlock(block_b, self._function_b)
+            diffs[(block_a, block_b)] = FunctionDiff._block_diff_constants(ba, bb)
+        return diffs
 
     @property
     def block_matches(self):
@@ -401,18 +425,18 @@ class FunctionDiff(object):
     @staticmethod
     def get_normalized_block(addr, function):
         """
-        :param addr: where to start the normalized block
-        :param function: function containing the block address
-        :return: a normalized basic block
+        :param addr:        Where to start the normalized block.
+        :param function:    A function containing the block address.
+        :returns:           A normalized basic block.
         """
         return NormalizedBlock(addr, function)
 
     def block_similarity(self, block_a, block_b):
         """
-        :param block_a: the first block address
-        :param block_b: the second block address
-        :return: the similarity of the basic blocks, normalized for the base address of the block and function call
-        addresses
+        :param block_a: The first block address.
+        :param block_b: The second block address.
+        :returns:       The similarity of the basic blocks, normalized for the base address of the block and function
+                        call addresses.
         """
 
         # handle sim procedure blocks
@@ -426,10 +450,14 @@ class FunctionDiff(object):
             block_a = NormalizedBlock(block_a, self._function_a)
         except AngrMemoryError:
             block_a = None
+        except AngrTranslationError:
+            block_a = None
 
         try:
             block_b = NormalizedBlock(block_b, self._function_b)
         except AngrMemoryError:
+            block_b = None
+        except AngrTranslationError:
             block_b = None
 
         # if both were None then they are assumed to be the same, if only one was the same they are assumed to differ
@@ -466,11 +494,12 @@ class FunctionDiff(object):
 
         return similarity
 
-    def blocks_probably_identical(self, block_a, block_b):
+    def blocks_probably_identical(self, block_a, block_b, check_constants=False):
         """
-        :param block_a: the first block address
-        :param block_b: the second block address
-        :return: Whether or not the blocks appear to be identical
+        :param block_a:         The first block address.
+        :param block_b:         The second block address.
+        :param check_constants: Whether or not to require matching constants in blocks.
+        :returns:               Whether or not the blocks appear to be identical.
         """
         # handle sim procedure blocks
         if self._project_a.is_hooked(block_a) and self._project_b.is_hooked(block_b):
@@ -480,10 +509,14 @@ class FunctionDiff(object):
             block_a = NormalizedBlock(block_a, self._function_a)
         except AngrMemoryError:
             block_a = None
+        except AngrTranslationError:
+            block_a = None
 
         try:
             block_b = NormalizedBlock(block_b, self._function_b)
         except AngrMemoryError:
+            block_b = None
+        except AngrTranslationError:
             block_b = None
 
         # if both were None then they are assumed to be the same, if only one was None they are assumed to differ
@@ -497,12 +530,13 @@ class FunctionDiff(object):
             return False
 
         # check differing constants
-        diff_constants = []
-        for irsb_a, irsb_b in zip(block_a.blocks, block_b.blocks):
-            try:
-                diff_constants += differing_constants(irsb_a, irsb_b)
-            except UnmatchedStatementsException:
-                return False
+        try:
+            diff_constants = FunctionDiff._block_diff_constants(block_a, block_b)
+        except UnmatchedStatementsException:
+            return False
+
+        if not check_constants:
+            return True
 
         # get values of differences that probably indicate no change
         acceptable_differences = self._get_acceptable_constant_differences(block_a, block_b)
@@ -530,10 +564,17 @@ class FunctionDiff(object):
         return True
 
     @staticmethod
+    def _block_diff_constants(block_a, block_b):
+        diff_constants = []
+        for irsb_a, irsb_b in zip(block_a.blocks, block_b.blocks):
+            diff_constants += differing_constants(irsb_a, irsb_b)
+        return diff_constants
+
+    @staticmethod
     def _compute_block_attributes(function):
         """
-        :param function: A normalized function object
-        :return: a dictionary of basic block addresses to tuples of attributes
+        :param function:    A normalized function object.
+        :returns:           A dictionary of basic block addresses to tuples of attributes.
         """
         # The attributes we use are the distance form function start, distance from function exit and whether
         # or not it has a subfunction call
@@ -558,17 +599,24 @@ class FunctionDiff(object):
     @staticmethod
     def _distances_from_function_start(function):
         """
-        :param function: A normalized Function object
-        :return: a dictionary of basic block addresses and their distance to the start of the function
+        :param function:    A normalized Function object.
+        :returns:           A dictionary of basic block addresses and their distance to the start of the function.
         """
         return networkx.single_source_shortest_path_length(function.graph,
                                                            function.startpoint)
 
     @staticmethod
+    def _block_diff_constants(block_a, block_b):
+        diff_constants = []
+        for irsb_a, irsb_b in zip(block_a.blocks, block_b.blocks):
+            diff_constants += differing_constants(irsb_a, irsb_b)
+        return diff_constants
+
+    @staticmethod
     def _distances_from_function_exit(function):
         """
-        :param function: A normalized Function object
-        :return: a dictionary of basic block addresses and their distance to the exit of the function
+        :param function:    A normalized Function object.
+        :returns:           A dictionary of basic block addresses and their distance to the exit of the function.
         """
         reverse_graph = function.graph.reverse()
         # we aren't guaranteed to have an exit from the function so explicitly add the node
@@ -582,7 +630,7 @@ class FunctionDiff(object):
         # if there were no exits (a function with a while 1) let's consider the block with the highest address to
         # be the exit. This isn't the most scientific way, but since this case is pretty rare it should be okay
         if not found_exits:
-            last = max(function.graph.nodes())
+            last = max(function.graph.nodes(), key=lambda x:x.addr)
             reverse_graph.add_edge("start", last)
 
         dists = networkx.single_source_shortest_path_length(reverse_graph, "start")
@@ -598,11 +646,13 @@ class FunctionDiff(object):
 
     def _compute_diff(self):
         """
-        Computes the diff of the functions and saves the result
+        Computes the diff of the functions and saves the result.
         """
         # get the attributes for all blocks
-        l.debug("Computing diff of functions: %s, %s", hex(self._function_a.startpoint),
-                hex(self._function_b.startpoint))
+        l.debug("Computing diff of functions: %s, %s",
+                ("%#x" % self._function_a.startpoint.addr) if self._function_a.startpoint is not None else "None",
+                ("%#x" % self._function_b.startpoint.addr) if self._function_b.startpoint is not None else "None"
+                )
         self.attributes_a = self._compute_block_attributes(self._function_a)
         self.attributes_b = self._compute_block_attributes(self._function_b)
 
@@ -626,7 +676,7 @@ class FunctionDiff(object):
         # while queue is not empty
         while to_process:
             (block_a, block_b) = to_process.pop()
-            l.debug("FunctionDiff: Processing (%#x, %#x)", block_a, block_b)
+            l.debug("FunctionDiff: Processing (%#x, %#x)", block_a.addr, block_b.addr)
 
             # we could find new matches in the successors or predecessors of functions
             block_a_succ = self._function_a.graph.successors(block_a)
@@ -655,10 +705,10 @@ class FunctionDiff(object):
             for (x, y) in new_matches:
                 if (x, y) not in processed_matches:
                     processed_matches.add((x, y))
-                    l.debug("FunctionDiff: checking if (%#x, %#x) is better", x, y)
+                    l.debug("FunctionDiff: checking if (%#x, %#x) is better", x.addr, y.addr)
                     # if it's a better match than what we already have use it
                     if _is_better_match(x, y, matched_a, matched_b, self.attributes_a, self.attributes_b):
-                        l.debug("FunctionDiff: adding possible match (%#x, %#x)", x, y)
+                        l.debug("FunctionDiff: adding possible match (%#x, %#x)", x.addr, y.addr)
                         if x in matched_a:
                             old_match = matched_a[x]
                             del matched_b[old_match]
@@ -677,9 +727,10 @@ class FunctionDiff(object):
         self._unmatched_blocks_from_b = set(x for x in self._function_b.graph.nodes() if x not in matched_b)
 
     @staticmethod
-    def _get_ordered_successors(project, addr, succ):
+    def _get_ordered_successors(project, block, succ):
         try:
             # add them in order of the vex
+            addr = block.addr
             succ = set(succ)
             ordered_succ = []
             bl = project.factory.block(addr)
@@ -688,22 +739,26 @@ class FunctionDiff(object):
                     ordered_succ.append(x)
 
             # add the rest (sorting might be better than no order)
-            for s in sorted(succ - set(ordered_succ)):
+            for s in sorted(succ - set(ordered_succ), key=lambda x:x.addr):
                 ordered_succ.append(s)
             return ordered_succ
         except AngrMemoryError:
-            return sorted(succ)
-
+            return sorted(succ, key=lambda x:x.addr)
+        except AngrTranslationError:
+            return sorted(succ, key=lambda x:x.addr)
 
     def _get_block_matches(self, attributes_a, attributes_b, filter_set_a=None, filter_set_b=None, delta=(0, 0, 0),
                            tiebreak_with_block_similarity=False):
         """
-        :param attributes_a: dict of blocks to their attributes
-        :param attributes_b: dict of blocks to their attributes
-        :param filter_set_a: an optional set to limit attributes_a to the blocks in this set
-        :param filter_set_b: an optional set to limit attributes_b to the blocks in this set
-        :param delta: offset to add to each vector in attributes_a
-        :return: a list of tuples of matching objects
+        :param attributes_a:    A dict of blocks to their attributes
+        :param attributes_b:    A dict of blocks to their attributes
+
+        The following parameters are optional.
+
+        :param filter_set_a:    A set to limit attributes_a to the blocks in this set.
+        :param filter_set_b:    A set to limit attributes_b to the blocks in this set.
+        :param delta:           An offset to add to each vector in attributes_a.
+        :returns:               A list of tuples of matching objects.
         """
         # get the attributes that are in the sets
         if filter_set_a is None:
@@ -798,17 +853,27 @@ class BinDiff(Analysis):
     """
     This class computes the a diff between two binaries represented by angr Projects
     """
-    def __init__(self, other_project):
+    def __init__(self, other_project, enable_advanced_backward_slicing=False, cfg_a=None, cfg_b=None):
         """
         :param other_project: The second project to diff
         """
         l.debug("Computing cfg's")
-        self.cfg_a = self.project.analyses.CFG(context_sensitivity_level=1,
-                                               keep_state=True,
-                                               enable_symbolic_back_traversal=True)
-        self.cfg_b = other_project.analyses.CFG(context_sensitivity_level=1,
-                                                keep_state=True,
-                                                enable_symbolic_back_traversal=True)
+
+        back_traversal = not enable_advanced_backward_slicing
+
+        if cfg_a is None:
+            self.cfg_a = self.project.analyses.CFG(context_sensitivity_level=1,
+                                                   keep_state=True,
+                                                   enable_symbolic_back_traversal=back_traversal,
+                                                   enable_advanced_backward_slicing=enable_advanced_backward_slicing)
+            self.cfg_b = other_project.analyses.CFG(context_sensitivity_level=1,
+                                                    keep_state=True,
+                                                    enable_symbolic_back_traversal=back_traversal,
+                                                    enable_advanced_backward_slicing=enable_advanced_backward_slicing)
+        else:
+            self.cfg_a = cfg_a
+            self.cfg_b = cfg_b
+
         l.debug("Done computing cfg's")
 
         self._p2 = other_project
@@ -822,22 +887,27 @@ class BinDiff(Analysis):
 
         self._compute_diff()
 
-    def functions_probably_identical(self, func_a_addr, func_b_addr):
+    def functions_probably_identical(self, func_a_addr, func_b_addr, check_consts=False):
         """
-        :param func_a_addr: The address of the first function (in the first binary)
-        :param func_b_addr: The address of the second function (in the second binary)
-        :return: whether or not the functions appear to be identical
+        Compare two functions and return True if they appear identical.
+
+        :param func_a_addr: The address of the first function (in the first binary).
+        :param func_b_addr: The address of the second function (in the second binary).
+        :returns:           Whether or not the functions appear to be identical.
         """
         if self.cfg_a.project.is_hooked(func_a_addr) and self.cfg_b.project.is_hooked(func_b_addr):
             return self.cfg_a.project._sim_procedures[func_a_addr] == self.cfg_b.project._sim_procedures[func_b_addr]
 
         func_diff = self.get_function_diff(func_a_addr, func_b_addr)
+        if check_consts:
+            return func_diff.probably_identical_with_consts
+
         return func_diff.probably_identical
 
     @property
     def identical_functions(self):
         """
-        :return: A list of function matches that appear to be identical
+        :returns: A list of function matches that appear to be identical
         """
         identical_funcs = []
         for (func_a, func_b) in self.function_matches:
@@ -848,7 +918,7 @@ class BinDiff(Analysis):
     @property
     def differing_functions(self):
         """
-        :return: A list of function matches that appear to differ
+        :returns: A list of function matches that appear to differ
         """
         different_funcs = []
         for (func_a, func_b) in self.function_matches:
@@ -856,15 +926,45 @@ class BinDiff(Analysis):
                 different_funcs.append((func_a, func_b))
         return different_funcs
 
-    @property
-    def all_differing_blocks(self):
+    def differing_functions_with_consts(self):
         """
-        :return: A list of block matches that appear to differ
+        :return: A list of function matches that appear to differ including just by constants
+        """
+        different_funcs = []
+        for (func_a, func_b) in self.function_matches:
+            if not self.functions_probably_identical(func_a, func_b, check_consts=True):
+                different_funcs.append((func_a, func_b))
+        return different_funcs
+
+    @property
+    def differing_blocks(self):
+        """
+        :returns: A list of block matches that appear to differ
         """
         differing_blocks = []
         for (func_a, func_b) in self.function_matches:
             differing_blocks.extend(self.get_function_diff(func_a, func_b).differing_blocks)
         return differing_blocks
+
+    @property
+    def identical_blocks(self):
+        """
+        :return A list of all block matches that appear to be identical
+        """
+        identical_blocks = []
+        for (func_a, func_b) in self.function_matches:
+            identical_blocks.extend(self.get_function_diff(func_a, func_b).identical_blocks)
+        return identical_blocks
+
+    @property
+    def blocks_with_differing_constants(self):
+        """
+        :return: A dict of block matches with differing constants to the tuple of constants
+        """
+        diffs = dict()
+        for (func_a, func_b) in self.function_matches:
+            diffs.update(self.get_function_diff(func_a, func_b).blocks_with_differing_constants)
+        return diffs
 
     @property
     def unmatched_functions(self):
@@ -875,12 +975,12 @@ class BinDiff(Analysis):
         """
         :param function_addr_a: The address of the first function (in the first binary)
         :param function_addr_b: The address of the second function (in the second binary)
-        :return: the FunctionDiff of the two functions
+        :returns: the FunctionDiff of the two functions
         """
         pair = (function_addr_a, function_addr_b)
         if pair not in self._function_diffs:
-            function_a = self.cfg_a.function_manager.function(function_addr_a)
-            function_b = self.cfg_b.function_manager.function(function_addr_b)
+            function_a = self.cfg_a.kb.functions.function(function_addr_a)
+            function_b = self.cfg_b.kb.functions.function(function_addr_b)
             self._function_diffs[pair] = FunctionDiff(function_a, function_b, self)
         return self._function_diffs[pair]
 
@@ -888,21 +988,38 @@ class BinDiff(Analysis):
     def _compute_function_attributes(cfg):
         """
         :param cfg: An angr CFG object
-        :return: a dictionary of function addresses to tuples of attributes
+        :returns:    a dictionary of function addresses to tuples of attributes
         """
         # the attributes we use are the number of basic blocks, number of edges, and number of subfunction calls
         attributes = dict()
-        for function_addr in cfg.function_manager.functions:
-            normalized_funtion = NormalizedFunction(cfg.function_manager.function(function_addr))
-            number_of_basic_blocks = len(normalized_funtion.graph.nodes())
-            number_of_edges = len(normalized_funtion.graph.edges())
-            number_of_subfunction_calls = len(cfg.function_manager.interfunction_graph.successors(function_addr))
+        all_funcs = set(cfg.kb.callgraph.nodes())
+        for function_addr in cfg.kb.functions:
+            # skip syscalls and functions which are None in the cfg
+            if cfg.kb.functions.function(function_addr) is None or cfg.kb.functions.function(function_addr).is_syscall:
+                continue
+            if cfg.kb.functions.function(function_addr) is not None:
+                normalized_funtion = NormalizedFunction(cfg.kb.functions.function(function_addr))
+                number_of_basic_blocks = len(normalized_funtion.graph.nodes())
+                number_of_edges = len(normalized_funtion.graph.edges())
+            else:
+                number_of_basic_blocks = 0
+                number_of_edges = 0
+            if function_addr in all_funcs:
+                number_of_subfunction_calls = len(cfg.kb.callgraph.successors(function_addr))
+            else:
+                number_of_subfunction_calls = 0
             attributes[function_addr] = (number_of_basic_blocks, number_of_edges, number_of_subfunction_calls)
 
         return attributes
 
     def _get_call_site_matches(self, func_a, func_b):
         possible_matches = set()
+
+        # Make sure those functions are not SimProcedures
+        f_a = self.cfg_a.kb.functions.function(func_a)
+        f_b = self.cfg_b.kb.functions.function(func_b)
+        if f_a.startpoint is None or f_b.startpoint is None:
+            return possible_matches
 
         fd = self.get_function_diff(func_a, func_b)
         basic_block_matches = fd.block_matches
@@ -943,8 +1060,8 @@ class BinDiff(Analysis):
                 plt_matches.append((addr, func_to_addr_b[name]))
 
         # remove ones that aren't in the interfunction graph, because these seem to not be consistent
-        all_funcs_a = set(self.cfg_a.function_manager.interfunction_graph.nodes())
-        all_funcs_b = set(self.cfg_b.function_manager.interfunction_graph.nodes())
+        all_funcs_a = set(self.cfg_a.kb.callgraph.nodes())
+        all_funcs_b = set(self.cfg_b.kb.callgraph.nodes())
         plt_matches = [x for x in plt_matches if x[0] in all_funcs_a and x[1] in all_funcs_b]
 
         return plt_matches
@@ -979,10 +1096,15 @@ class BinDiff(Analysis):
             l.debug("Processing (%#x, %#x)", func_a, func_b)
 
             # we could find new matches in the successors or predecessors of functions
-            func_a_succ = self.cfg_a.function_manager.interfunction_graph.successors(func_a)
-            func_b_succ = self.cfg_b.function_manager.interfunction_graph.successors(func_b)
-            func_a_pred = self.cfg_a.function_manager.interfunction_graph.predecessors(func_a)
-            func_b_pred = self.cfg_b.function_manager.interfunction_graph.predecessors(func_b)
+            if not self.project.loader.main_bin.contains_addr(func_a):
+                continue
+            if not self._p2.loader.main_bin.contains_addr(func_b):
+                continue
+
+            func_a_succ = self.cfg_a.kb.callgraph.successors(func_a)
+            func_b_succ = self.cfg_b.kb.callgraph.successors(func_b)
+            func_a_pred = self.cfg_a.kb.callgraph.predecessors(func_a)
+            func_b_pred = self.cfg_b.kb.callgraph.predecessors(func_b)
 
             # get possible new matches
             new_matches = set(self._get_function_matches(self.attributes_a, self.attributes_b,
@@ -995,6 +1117,12 @@ class BinDiff(Analysis):
 
             # for each of the possible new matches add it if it improves the matching
             for (x, y) in new_matches:
+                # skip none functions and syscalls
+                if self.cfg_a.kb.functions.function(x) is None or self.cfg_a.kb.functions.function(x).is_syscall:
+                    continue
+                if self.cfg_b.kb.functions.function(y) is None or self.cfg_b.kb.functions.function(y).is_syscall:
+                    continue
+
                 if (x, y) not in processed_matches:
                     processed_matches.add((x, y))
                     # if it's a better match than what we already have use it
@@ -1014,11 +1142,15 @@ class BinDiff(Analysis):
                         to_process.appendleft((x, y))
 
         # reformat matches into a set of pairs
-        self.function_matches = set((x, y) for (x, y) in matched_a.items())
+        self.function_matches = set()
+        for x,y in matched_a.items():
+            # only keep if the pair is in the binary ranges
+            if self.project.loader.main_bin.contains_addr(x) and self._p2.loader.main_bin.contains_addr(y):
+                self.function_matches.add((x, y))
 
-        # get the unmatched blocks
-        self._unmatched_functions_from_a = set(x for x in self.cfg_a.function_manager.functions if x not in matched_a)
-        self._unmatched_functions_from_b = set(x for x in self.cfg_b.function_manager.functions if x not in matched_b)
+        # get the unmatched functions
+        self._unmatched_functions_from_a = set(x for x in self.attributes_a.keys() if x not in matched_a)
+        self._unmatched_functions_from_b = set(x for x in self.attributes_b.keys() if x not in matched_b)
 
         # remove unneeded function diffs
         for (x, y) in dict(self._function_diffs):
@@ -1028,11 +1160,14 @@ class BinDiff(Analysis):
     @staticmethod
     def _get_function_matches(attributes_a, attributes_b, filter_set_a=None, filter_set_b=None):
         """
-        :param attributes_a: dict of functions to their attributes
-        :param attributes_b: dict of functions to their attributes
-        :param filter_set_a: an optional set to limit attributes_a to the functions in this set
-        :param filter_set_b: an optional set to limit attributes_b to the functions in this set
-        :return: a list of tuples of matching objects
+        :param attributes_a:    A dict of functions to their attributes
+        :param attributes_b:    A dict of functions to their attributes
+
+        The following parameters are optional.
+
+        :param filter_set_a:    A set to limit attributes_a to the functions in this set.
+        :param filter_set_b:    A set to limit attributes_b to the functions in this set.
+        :returns:               A list of tuples of matching objects.
         """
         # get the attributes that are in the sets
         if filter_set_a is None:

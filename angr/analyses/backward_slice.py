@@ -15,6 +15,9 @@ from .code_location import CodeLocation
 l = logging.getLogger(name="angr.analyses.backward_slice")
 
 class BackwardSlice(Analysis):
+    """
+    Represents a backward slice of the program.
+    """
 
     def __init__(self, cfg, cdg, ddg,
                  targets=None,
@@ -31,17 +34,17 @@ class BackwardSlice(Analysis):
         to generate, but it only reflects those states while generating the CFG, and it is neither sound nor accurate.
         The VSA based DDG (called VSA_DDG) is based on static analysis, which gives you a much better result.
 
-        :param cfg: The control flow graph.
-        :param cdg: The control dependence graph.
-        :param ddg: The data dependence graph.
-        :param targets: A list of "target" that specify targets of the backward slices. Each target can be a tuple in
-            form of (cfg_node, stmt_idx), or a CodeLocation instance.
-        :param cfg_node: Deprecated. The target CFGNode to reach. It should exist in the CFG.
-        :param stmt_id: Deprecated. The target statement to reach.
-        :param control_flow_slice: True/False, indicates whether we should slice only based on CFG. Sometimes when
-                acquiring DDG is difficult or impossible, you can just create a slice on your CFG.
-                Well, if you don't even have a CFG, then...
-        :param no_construct: Only used for testing and debugging to easily create a BackwardSlice object
+        :param cfg:                 The control flow graph.
+        :param cdg:                 The control dependence graph.
+        :param ddg:                 The data dependence graph.
+        :param targets:             A list of "target" that specify targets of the backward slices. Each target can be a
+                                    tuple in form of (cfg_node, stmt_idx), or a CodeLocation instance.
+        :param cfg_node:            Deprecated. The target CFGNode to reach. It should exist in the CFG.
+        :param stmt_id:             Deprecated. The target statement to reach.
+        :param control_flow_slice:  True/False, indicates whether we should slice only based on CFG. Sometimes when
+                                    acquiring DDG is difficult or impossible, you can just create a slice on your CFG.
+                                    Well, if you don't even have a CFG, then...
+        :param no_construct:        Only used for testing and debugging to easily create a BackwardSlice object.
         """
 
         self._cfg = cfg
@@ -68,9 +71,10 @@ class BackwardSlice(Analysis):
                 else:
                     raise AngrBackwardSlicingError('Unsupported type of target %s' % t)
 
-        # Save a list of taints to beginwwith at the beginning of each SimRun
+        # Save a list of taints to begin with at the beginning of each SimRun
         self.initial_taints_per_run = None
         self.runs_in_slice = None
+        self.cfg_nodes_in_slice = None
         # IDs of all chosen statement for each SimRun
         self.chosen_statements = defaultdict(set)
         # IDs for all chosen exit statements as well as their corresponding targets
@@ -87,40 +91,76 @@ class BackwardSlice(Analysis):
         s = "BackwardSlice (to %s)" % self._targets
         return s
 
-    def dbg_repr(self):
+    def dbg_repr(self, max_display=10):
+        """
+        Debugging output of this slice.
+
+        :param max_display: The maximum number of SimRun slices to show.
+        :return:            A string representation.
+        """
+
         s = repr(self) + "\n"
 
-        MAX_RUNS_TO_DISPLAY = 10
-
-        if len(self.chosen_statements) > MAX_RUNS_TO_DISPLAY:
-            s += "%d SimRuns in program slice, display %d.\n" % (len(self.chosen_statements), MAX_RUNS_TO_DISPLAY)
+        if len(self.chosen_statements) > max_display:
+            s += "%d SimRuns in program slice, displaying %d.\n" % (len(self.chosen_statements), max_display)
         else:
             s += "%d SimRuns in program slice.\n" % len(self.chosen_statements)
 
-        # Pretty-print the first `MAX_RUNS_TO_DISPLAY` basic blocks
-        for run_addr in self.chosen_statements.keys()[ : MAX_RUNS_TO_DISPLAY ]:
-            if self.project.is_hooked(run_addr):
-                ss = "%#x Hooked\n" % run_addr
+        # Pretty-print the first `max_display` basic blocks
+        if max_display is None:
+            # Output all
+            run_addrs = sorted(self.chosen_statements.keys())
 
-            else:
-                ss = "%#x\n" % run_addr
+        else:
+            # Only output the first "max_display" ones
+            run_addrs = sorted(self.chosen_statements.keys())[ : max_display]
 
-                chosen_statements = self.chosen_statements[run_addr]
-
-                vex_block = self.project.factory.block(run_addr).vex
-
-                statements = vex_block.statements
-                for i in range(0, len(statements)):
-                    if i in chosen_statements:
-                        line = "+"
-                    else:
-                        line = "-"
-                    line += "[% 3d] " % i
-                    line += str(statements[i])
-                    ss += line + "\n"
-            s += ss + "\n"
+        for run_addr in run_addrs:
+            s += self.dbg_repr_run(run_addr) + "\n"
 
         return s
+
+    def dbg_repr_run(self, run_addr):
+        """
+        Debugging output of a single SimRun slice.
+
+        :param run_addr:    Address of the SimRun.
+        :return:            A string representation.
+        """
+
+        if self.project.is_hooked(run_addr):
+            ss = "%#x Hooked\n" % run_addr
+
+        else:
+            ss = "%#x\n" % run_addr
+
+            # statements
+            chosen_statements = self.chosen_statements[run_addr]
+
+            vex_block = self.project.factory.block(run_addr).vex
+
+            statements = vex_block.statements
+            for i in range(0, len(statements)):
+                if i in chosen_statements:
+                    line = "+"
+                else:
+                    line = "-"
+                line += "[% 3d] " % i
+                line += str(statements[i])
+                ss += line + "\n"
+
+            # exits
+            targets = self.chosen_exits[run_addr]
+            addr_strs = [ ]
+            for exit_stmt_id, target_addr in targets:
+                if target_addr is None:
+                    addr_strs.append("default")
+                else:
+                    addr_strs.append("%#x" % target_addr)
+
+            ss += "Chosen exits: " + ", ".join(addr_strs)
+
+        return ss
 
     def annotated_cfg(self, start_point=None):
         """
@@ -163,12 +203,12 @@ class BackwardSlice(Analysis):
         Query in taint graph to check if a specific taint will taint the IP in the future or not.
         The taint is specified with the tuple (simrun_addr, stmt_idx, taint_type).
 
-        :param simrun_addr: Address of the SimRun
-        :param stmt_idx: Statement ID
-        :param taint_type: Type of the taint, might be one of the following: 'reg', 'tmp', 'mem'
-        :param simrun_whitelist: A list of SimRun addresses that are whitelisted, i.e. the tainted exit will be ignored
-                                if it is in those SimRuns
-        :return: True/False
+        :param simrun_addr:         Address of the SimRun.
+        :param stmt_idx:            Statement ID.
+        :param taint_type:          Type of the taint, might be one of the following: 'reg', 'tmp', 'mem'.
+        :param simrun_whitelist:    A list of SimRun addresses that are whitelisted, i.e. the tainted exit will be
+                                    ignored if it is in those SimRuns.
+        :returns:                   True/False
         """
 
         if simrun_whitelist is None:
@@ -206,11 +246,11 @@ class BackwardSlice(Analysis):
         Query in taint graph to check if a specific taint will taint the stack pointer in the future or not.
         The taint is specified with the tuple (simrun_addr, stmt_idx, taint_type).
 
-        :param simrun_addr: Address of the SimRun
-        :param stmt_idx: Statement ID
-        :param taint_type: Type of the taint, might be one of the following: 'reg', 'tmp', 'mem'
-        :param simrun_whitelist: A list of SimRun addresses that are whitelisted
-        :return: True/False
+        :param simrun_addr:         Address of the SimRun.
+        :param stmt_idx:            Statement ID.
+        :param taint_type:          Type of the taint, might be one of the following: 'reg', 'tmp', 'mem'.
+        :param simrun_whitelist:    A list of SimRun addresses that are whitelisted.
+        :returns:                   True/False.
         """
 
         if simrun_whitelist is None:
@@ -249,9 +289,8 @@ class BackwardSlice(Analysis):
         """
         Construct a dependency graph based on given parameters.
 
-        :param targets: A list of tuples like (CFGNode, statement ID)
-        :param control_flow_slice: Is the backward slicing only depends on CFG or not
-        :return: None
+        :param targets:             A list of tuples like (CFGNode, statement ID)
+        :param control_flow_slice:  Is the backward slicing only depends on CFG or not.
         """
 
         if control_flow_slice:
@@ -266,9 +305,8 @@ class BackwardSlice(Analysis):
         Build a slice of the program without considering the effect of data dependencies.
         This is an incorrect hack, but it should work fine with small programs.
 
-        :param simruns: A list of SimRun targets. You probably wanna get it from the CFG somehow. It
-                    must exist in the CFG.
-        :return: None
+        :param simruns: A list of SimRun targets. You probably wanna get it from the CFG somehow. It must exist in the
+                        CFG.
         """
 
         # TODO: Support context-sensitivity!
@@ -310,7 +348,6 @@ class BackwardSlice(Analysis):
         :param targets: A list of tuples like (cfg_node, stmt_idx), where cfg_node is a CFGNode instance where the
                         backward slice starts, and it must be included in CFG and CDG. stmt_idx is the ID of the target
                         statement where the backward slice starts.
-        :return: None
         """
 
         # TODO: Support context-sensitivity
@@ -383,9 +420,9 @@ class BackwardSlice(Analysis):
         Source block has more than one exit, and through some of those exits, the control flow can eventually go to
         the target block. This method returns exits that lead to the target block.
 
-        :param src_block: The block that has multiple exits
-        :param target_block: The target block to reach
-        :return: a dict of statement ID -> a list of target IPs (or None if the exit should not be taken), each
+        :param src_block:       The block that has multiple exits.
+        :param target_block:    The target block to reach.
+        :returns: a dict of statement ID -> a list of target IPs (or None if the exit should not be taken), each
                 corresponds to an exit to take in order to reach the target.
                 For example, it returns the following dict:
                 {
@@ -452,8 +489,8 @@ class BackwardSlice(Analysis):
         """
         Based on control dependence graph, pick all exits (statements) that lead to the target.
 
-        :param target_node: A CFGNode instance
-        :return: A set of new tainted code locations
+        :param target_node: A CFGNode instance.
+        :returns:           A set of new tainted code locations.
         """
 
         new_taints = set()
@@ -475,6 +512,18 @@ class BackwardSlice(Analysis):
                         self._pick_statement(predecessor.addr,
                                              self._normalize_stmt_idx(predecessor.addr, stmt_idx)
                                              )
+                        # If it's the default statement, we should also pick other conditional exit statements
+                        if stmt_idx == 'default':
+                            conditional_exits = self._conditional_exits(predecessor.addr)
+                            for conditional_exit_stmt_id in conditional_exits:
+                                cl = CodeLocation(predecessor.addr,
+                                                  self._normalize_stmt_idx(predecessor.addr, conditional_exit_stmt_id)
+                                                  )
+                                new_taints.add(cl)
+
+                                self._pick_statement(predecessor.addr,
+                                                     self._normalize_stmt_idx(predecessor.addr, conditional_exit_stmt_id)
+                                                     )
 
                     if target_addresses is not None:
 
@@ -488,6 +537,18 @@ class BackwardSlice(Analysis):
                         # Mark those exits as picked
                         for target_address in target_addresses:
                             self._pick_exit(predecessor.addr, stmt_idx, target_address)
+
+                    # On CFG, pick default exits of all nodes between predecessor and our target node
+                    # Usually this is not required if basic blocks strictly end at control flow transitions. But this is
+                    # not always the case for some architectures
+                    all_simple_paths = list(networkx.all_simple_paths(self._cfg.graph, predecessor, target_node, cutoff=3))
+
+                    previous_node = None
+                    for path in all_simple_paths:
+                        for node in path:
+                            self._pick_statement(node.addr, self._normalize_stmt_idx(node.addr, 'default'))
+                            if previous_node is not None:
+                                self._pick_exit(previous_node.addr, 'default', node.addr)
 
         return new_taints
 
@@ -528,8 +589,8 @@ class BackwardSlice(Analysis):
         """
         Include a statement in the final slice.
 
-        :param block_address: Address of the basic block
-        :param stmt_idx: Statement ID
+        :param block_address:   Address of the basic block.
+        :param stmt_idx:        Statement ID.
         """
 
         # TODO: Support context-sensitivity
@@ -538,11 +599,11 @@ class BackwardSlice(Analysis):
 
     def _pick_exit(self, block_address, stmt_idx, target_ips):
         """
-        Include an exit in the final slice
+        Include an exit in the final slice.
 
-        :param block_address: Address of the basic block
-        :param stmt_idx: ID of the exit statement
-        :param target_ips: The target address of this exit statement
+        :param block_address:   Address of the basic block.
+        :param stmt_idx:        ID of the exit statement.
+        :param target_ips:      The target address of this exit statement.
         """
 
         # TODO: Support context-sensitivity
@@ -555,13 +616,30 @@ class BackwardSlice(Analysis):
     # Helper functions
     #
 
+    def _conditional_exits(self, block_addr):
+        """
+        Return a list of conditional statement exits with respect to a basic block.
+
+        :param block_addr:  The address of the basic block.
+        :return:            A list of statement IDs.
+        """
+
+        vex_block = self.project.factory.block(block_addr).vex
+        lst = [ ]
+
+        for i, stmt in enumerate(vex_block.statements):
+            if isinstance(stmt, pyvex.IRStmt.Exit):
+                lst.append(i)
+
+        return lst
+
     def _normalize_stmt_idx(self, block_addr, stmt_idx):
         """
         For each statement ID, convert 'default' to (last_stmt_idx+1)
 
-        :param block_addr: The block address
-        :param stmt_idx: Statement ID
-        :return: New statement ID
+        :param block_addr:  The block address.
+        :param stmt_idx:    Statement ID.
+        :returns:           New statement ID.
         """
 
         if type(stmt_idx) in (int, long):
@@ -575,11 +653,11 @@ class BackwardSlice(Analysis):
 
     @staticmethod
     def _last_branching_statement(statements):
-        '''
+        """
         Search for the last branching exit, just like
         #   if (t12) { PUT(184) = 0xBADF00D:I64; exit-Boring }
         and then taint the temp variable inside if predicate
-        '''
+        """
         cmp_stmt_id = None
         cmp_tmp_id = None
         all_statements = len(statements)

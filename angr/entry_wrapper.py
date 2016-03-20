@@ -54,11 +54,11 @@ class CallStack(object):
 
     @staticmethod
     def stack_suffix_to_string(stack_suffix):
-        '''
+        """
         Convert a stack suffix to a human-readable string representation.
         :param stack_suffix:
         :return: A string
-        '''
+        """
         s = "[" + ",".join([("0x%x" % i) if i is not None else "Unspecified" for i in stack_suffix]) + "]"
         return s
 
@@ -211,9 +211,14 @@ class BBLStack(object):
         return "\n".join(s)
 
 class EntryWrapper(object):
-    def __init__(self, path, context_sensitivity_level, jumpkind=None, call_stack=None, bbl_stack=None, is_narrowing=False):
+    def __init__(self, path, context_sensitivity_level, src_simrun_key=None, src_exit_stmt_idx=None, jumpkind=None,
+                 call_stack=None, bbl_stack=None, is_narrowing=False, skip=False, cancelled_pending_entry=None):
         self._path = path
         self.jumpkind = jumpkind
+        self.src_simrun_key = src_simrun_key
+        self.src_exit_stmt_idx = src_exit_stmt_idx
+        self.skip = skip
+        self.cancelled_pending_entry = cancelled_pending_entry
 
         # Other parameters
         self._context_sensitivity_level = context_sensitivity_level
