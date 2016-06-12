@@ -17,6 +17,13 @@ VEX_DEFAULT_OPT_LEVEL = 1
 
 
 class Lifter(object):
+    """
+    The lifter is the part of the factory that deals with the logic related to lifting blocks to IR.
+    It is complicated enough that it gets its own class!
+
+    Usually, the only way you'll ever have to interact with this class is that its `lift` method has
+    been transplanted into the factory as `project.factory.block`.
+    """
     def __init__(self, project, cache=False):
         self._project = project
         self._thumbable = isinstance(project.arch, ArchARM)
@@ -321,8 +328,8 @@ class Block(object):
             if stmt.tag != 'Ist_IMark':
                 continue
             if self.addr is None:
-                self.addr = stmt.addr
-            self.instruction_addrs.append(stmt.addr)
+                self.addr = stmt.addr + stmt.delta
+            self.instruction_addrs.append(stmt.addr + stmt.delta)
 
         if self.addr is None:
             l.warning('Lifted basic block with no IMarks!')

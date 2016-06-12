@@ -5,7 +5,6 @@ from collections import defaultdict
 import networkx
 
 from simuvex import SimProcedures, o
-from simuvex.procedures.syscalls import handler
 
 from ..errors import AngrError, AngrCFGError
 from ..analysis import Analysis, register_analysis
@@ -14,8 +13,10 @@ from ..path import Path, AngrPathError
 
 l = logging.getLogger('angr.analyses.veritesting')
 
+
 class VeritestingError(Exception):
     pass
+
 
 class CallTracingFilter(object):
     whitelist = {
@@ -34,12 +35,12 @@ class CallTracingFilter(object):
 
     def filter(self, call_target_state, jumpkind):
         """
-            The call will be skipped if it returns True.
+        The call will be skipped if it returns True.
 
-            :param call_target_state: The new state of the call target.
-            :parm jumpkind:           The Jumpkind of this call.
-            :returns:                 True if we want to skip this call, False otherwise.
-            """
+        :param call_target_state:   The new state of the call target.
+        :param jumpkind:            The Jumpkind of this call.
+        :returns:                   True if we want to skip this call, False otherwise.
+        """
 
         ACCEPT = False
         REJECT = True
@@ -84,20 +85,13 @@ class CallTracingFilter(object):
             tmp_path = self.project.factory.path(call_target_state)
             tmp_path.step()
             next_run = tmp_path.next_run
-            if isinstance(next_run, handler.handler):
-                syscall = next_run.syscall
-                if type(syscall) in CallTracingFilter.whitelist:
-                    # accept!
-                    l.debug('Accepting target 0x%x, jumpkind %s', addr, jumpkind)
-                    return ACCEPT
-                else:
-                    # reject
-                    l.debug('Rejecting target 0x%x - syscall %s not in whitelist', addr, syscall)
-                    return REJECT
+            if type(next_run) in CallTracingFilter.whitelist:
+                # accept!
+                l.debug('Accepting target 0x%x, jumpkind %s', addr, jumpkind)
+                return ACCEPT
             else:
-                # The syscall is not handled?
                 # reject
-                l.debug('Rejecting target 0x%x - Unsupported syscall handler %s', addr, next_run)
+                l.debug('Rejecting target 0x%x - syscall %s not in whitelist', addr, syscall)
                 return REJECT
 
         cfg_key = (addr, jumpkind)
@@ -105,7 +99,7 @@ class CallTracingFilter(object):
             new_blacklist = self.blacklist[ :: ]
             new_blacklist.append(addr)
             tracing_filter = CallTracingFilter(self.project, depth=self.depth + 1, blacklist=new_blacklist)
-            cfg = self.project.analyses.CFG(starts=((addr, jumpkind),),
+            cfg = self.project.analyses.CFGAccurate(starts=((addr, jumpkind),),
                                                initial_state=call_target_state,
                                                context_sensitivity_level=0,
                                                call_depth=0,
@@ -153,6 +147,7 @@ class CallTracingFilter(object):
         l.debug('Accepting target 0x%x, jumpkind %s', addr, jumpkind)
         return ACCEPT
 
+
 class Ref(object):
     def __init__(self, type, addr, actual_addrs, bits, value, action):
         """
@@ -192,6 +187,7 @@ class Ref(object):
     def __hash__(self):
         return hash("%s_%s_%s" % (self.type, hash(tuple(self.actual_addrs)), self.bits))
 
+
 class ITETreeNode(object):
     def __init__(self, guard=None, true_expr=None, false_expr=None):
         self.guard = guard
@@ -220,11 +216,13 @@ class ITETreeNode(object):
 
         return se.If(self.guard, true_branch_expr, false_branch_expr)
 
+
 class ActionQueue(object):
     def __init__(self, id, actions, parent_key=None):
         self.id = id
         self.actions = actions
         self.parent_key = parent_key
+
 
 class Veritesting(Analysis):
     # A cache for CFG we generated before
@@ -240,8 +238,8 @@ class Veritesting(Analysis):
 
         :param input_path:               The initial path to begin the execution with.
         :param boundaries:               Addresses where execution should stop.
-        :param loop_unrolling_limit:     The maximum times that Veritesting should unroll a loop for
-        :param enable_function_inlining: Whether we should enable function inlining and syscall inlining
+        :param loop_unrolling_limit:     The maximum times that Veritesting should unroll a loop for.
+        :param enable_function_inlining: Whether we should enable function inlining and syscall inlining.
         :param terminator:               A callback function that takes a path as parameter. Veritesting will terminate
                                          if this function returns True.
         :param deviation_filter:         A callback function that takes a path as parameter. Veritesting will put the
@@ -310,7 +308,7 @@ class Veritesting(Analysis):
 
     def _execute_and_merge(self, path):
         """
-        Symbolically execute the program in a static manner. The basic idea is that, we look ahead by creating a CFG,
+        Symbolically execute the program in a static manner. The basic idea is that we look ahead by creating a CFG,
         then perform a _controlled symbolic exploration_ based on the CFG, one path at a time. The controlled symbolic
         exploration stops when it sees a branch whose both directions are all feasible, or it shall wait for a merge
         from another path.
@@ -318,8 +316,8 @@ class Veritesting(Analysis):
         A basic block will not be executed for more than *loop_unrolling_limit* times. If that is the case, a new state
         will be returned.
 
-        :param path: The initial path to start the execution
-        :returns:    A list of new states
+        :param path: The initial path to start the execution.
+        :returns:    A list of new states.
         """
 
         state = path.state
@@ -352,7 +350,7 @@ class Veritesting(Analysis):
                 if not state.se.symbolic(state.regs.rax):
                     cfg_initial_state.regs.rax = state.regs.rax
 
-            cfg = self.project.analyses.CFG(starts=((ip_int, path.jumpkind),),
+            cfg = self.project.analyses.CFGAccurate(starts=((ip_int, path.jumpkind),),
                                                context_sensitivity_level=0,
                                                call_depth=0,
                                                call_tracing_filter=filter,

@@ -12,13 +12,13 @@ from archinfo import ArchARM
 from ..entry_wrapper import EntryWrapper
 from ..analysis import Analysis, register_analysis
 from ..errors import AngrCFGError, AngrError, AngrForwardAnalysisSkipEntry
-from ..knowledge import Function, FunctionManager
+from ..knowledge import FunctionManager
 from ..path import make_path
 from .cfg_node import CFGNode
 from .cfg_base import CFGBase
 from .forward_analysis import ForwardAnalysis
 
-l = logging.getLogger(name="angr.analyses.cfg")
+l = logging.getLogger(name="angr.analyses.cfg_accurate")
 
 
 class PendingExit(object):
@@ -53,7 +53,7 @@ class PendingExit(object):
             self.returning_source) if self.returning_source is not None else 'Unknown')
 
 
-class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
+class CFGAccurate(ForwardAnalysis, CFGBase):
     """
     This class represents a control-flow graph.
     """
@@ -74,24 +74,24 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
                  ):
         """
         All parameters are optional.
-        
-        :param context_sensitivity_level:           The level of context-sensitivity of this CFG.
+
+        :param context_sensitivity_level:           The level of context-sensitivity of this CFG (see documentation for further details)
                                                     It ranges from 0 to infinity. Default 1.
         :param avoid_runs:                          A list of runs to avoid.
-        :param enable_function_hints:               Whether to use function hints or now.
+        :param enable_function_hints:               Whether to use function hints (constants that might be used as exit targets) or not.
         :param call_depth:                          How deep in the call stack to trace.
-        :param call_tracing_filter:                 ??? what the hell is this.
+        :param call_tracing_filter:                 Filter to apply on a given path and jumpkind to determine if it should be skipped when call_depth is reached
         :param initial_state:                       An initial state to use to begin analysis.
         :param starts:                              A list of addresses at which to begin analysis
         :param keep_state:                          Whether to keep the SimStates for each CFGNode.
-        :param enable_advanced_backward_slicing:
-        :param enable_symbolic_back_traversal:
+        :param enable_advanced_backward_slicing:    Whether to enable an intensive technique for resolving direct jumps
+        :param enable_symbolic_back_traversal:      Whether to enable an intensive technique for resolving indirect jumps
         :param additional_edges:                    A dict mapping addresses of basic blocks to addresses of
                                                     successors to manually include and analyze forward from.
         :param no_construct:                        Skip the construction procedure. Only used in unit-testing.
         """
         ForwardAnalysis.__init__(self)
-        CFGBase.__init__(self, self.project, context_sensitivity_level)
+        CFGBase.__init__(self, context_sensitivity_level)
         self._symbolic_function_initial_state = {}
         self._function_input_states = None
         self._loop_back_edges_set = set()
@@ -129,7 +129,7 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
         self._sanitize_parameters()
 
         self._executable_address_ranges = []
-        self._initialize_executable_ranges()
+        self._executable_address_ranges = self._executable_memory_regions()
 
         if not no_construct:
             self._analyze()
@@ -145,7 +145,7 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
         :return: A copy of the CFG instance.
         :rtype: angr.analyses.CFG
         """
-        new_cfg = CFG.__new__(CFG)
+        new_cfg = CFGAccurate.__new__(CFGAccurate)
         new_cfg.named_errors = dict(self.named_errors)
         new_cfg.errors = list(self.errors)
         new_cfg._fail_fast = self._fail_fast
@@ -617,18 +617,6 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
         if not self._starts:
             raise AngrCFGError("At least one start must be provided")
 
-    def _initialize_executable_ranges(self):
-        """
-        Collect all executable sections.
-        """
-
-        for b in self.project.loader.all_objects:
-            for seg in b.segments:
-                if seg.is_executable:
-                    min_addr = seg.min_addr + b.rebase_addr
-                    max_addr = seg.max_addr + b.rebase_addr
-                    self._executable_address_ranges.append((min_addr, max_addr))
-
     # CFG construction
     # The main loop and sub-methods
 
@@ -692,7 +680,7 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
             self._symbolic_function_initial_state[ip] = state
 
             entry_path = self.project.factory.path(state)
-            path_wrapper = EntryWrapper(entry_path, self._context_sensitivity_level, None, None)
+            path_wrapper = EntryWrapper(ip, entry_path, self._context_sensitivity_level, None, None)
 
             self._entries.append(path_wrapper)
 
@@ -822,13 +810,14 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
         pending_exit_state.scratch.jumpkind = 'Ijk_FakeRet'
 
         path = self.project.factory.path(pending_exit_state)
-        entry = EntryWrapper(path,
-                                    self._context_sensitivity_level,
-                                    pending_entry_src_simrun_key,
-                                    pending_entry_src_exit_stmt_idx,
-                                    call_stack=pending_exit_call_stack,
-                                    bbl_stack=pending_exit_bbl_stack
-                                    )
+        entry = EntryWrapper(path.addr,
+                             path,
+                             self._context_sensitivity_level,
+                             pending_entry_src_simrun_key,
+                             pending_entry_src_exit_stmt_idx,
+                             call_stack=pending_exit_call_stack,
+                             bbl_stack=pending_exit_bbl_stack
+                             )
         l.debug("Tracing a missing return exit %s", self._simrun_key_repr(pending_exit_tuple))
 
         return entry
@@ -854,7 +843,8 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
                     new_state.registers.store('t9', f)
 
                 new_path = self.project.factory.path(new_state)
-                new_path_wrapper = EntryWrapper(new_path,
+                new_path_wrapper = EntryWrapper(f,
+                                                new_path,
                                                 self._context_sensitivity_level
                                                 )
                 remaining_entries.append(new_path_wrapper)
@@ -899,13 +889,14 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
         # Extract initial info from entry_wrapper
         path = _locals['path'] = entry.path
         call_stack_suffix = _locals['call_stack_suffix'] = entry.call_stack_suffix()
-        addr = _locals['addr'] = entry.path.addr
+        addr = _locals['addr'] = entry.addr
         func_addr = _locals['func_addr'] = entry.current_function_address
         _locals['current_stack_pointer'] = entry.current_stack_pointer
         _locals['accessed_registers_in_function'] = entry.current_function_accessed_registers
-        _locals['current_function'] = self.kb.functions.function(_locals['func_addr'], create=True)
         jumpkind = _locals['jumpkind'] = 'Ijk_Boring' if entry.path.state.scratch.jumpkind is None else \
             entry.path.state.scratch.jumpkind
+        _locals['current_function'] = self.kb.functions.function(_locals['func_addr'], create=True,
+                                                                 syscall=jumpkind.startswith("Ijk_Sys"))
         src_simrun_key = entry.src_simrun_key
         src_exit_stmt_idx = entry.src_exit_stmt_idx
 
@@ -1328,6 +1319,10 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
             # time being.
             target_addr |= 1
 
+        # Fix target_addr for syscalls
+        if suc_jumpkind.startswith("Ijk_Sys"):
+            _, target_addr, _, _ = self.project._simos.syscall_info(new_state)
+
         self._pre_handle_successor_state(extra_info, suc_jumpkind, target_addr)
 
         # Remove pending targets - type 2
@@ -1399,7 +1394,8 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
         # before. Make sure it is still running in 'fastpath' mode
         # new_exit.state = self.project.simos.prepare_call_state(new_exit.state, initial_state=saved_state)
         new_path.state.set_mode('fastpath')
-        pw = EntryWrapper(new_path,
+        pw = EntryWrapper(target_addr,
+                          new_path,
                           self._context_sensitivity_level,
                           simrun_key,
                           suc_exit_stmt_idx,
@@ -2225,6 +2221,16 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
     # Private methods - creation of stuff (SimRun, CFGNode, call-stack, etc.)
 
     def _get_simrun(self, addr, current_entry, current_function_addr=None):
+        """
+        Create the correct SimRun instance.
+
+        :param int addr: Address of the SimRun
+        :param angr.Path current_entry: The Path object, with a state inside
+        :param int current_function_addr: Address of the current function
+        :return: A SimRun instance
+        :rtype: simuvex.SimRun
+        """
+
         error_occurred = False
         state = current_entry.state
         saved_state = current_entry.state  # We don't have to make a copy here
@@ -2249,7 +2255,15 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
 
                 old_proc = self.project._sim_procedures[addr][0]
                 old_name = None
-                if old_proc == simuvex.procedures.SimProcedures["stubs"]["ReturnUnconstrained"]:
+
+                if old_proc.IS_SYSCALL:
+                    new_stub = simuvex.procedures.SimProcedures["syscalls"]["stub"]
+                    ret_to = current_entry.addr
+                else:
+                    new_stub = simuvex.procedures.SimProcedures["stubs"]["ReturnUnconstrained"]
+                    ret_to = None
+
+                if old_proc is new_stub:
                     proc_kwargs = self.project._sim_procedures[addr][1]
                     if 'resolves' in proc_kwargs:
                         old_name = proc_kwargs['resolves']
@@ -2257,9 +2271,10 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
                 if old_name is None:
                     old_name = old_proc.__name__.split('.')[-1]
 
-                sim_run = simuvex.procedures.SimProcedures["stubs"]["ReturnUnconstrained"](
+                sim_run = new_stub(
                     state,
                     addr=addr,
+                    ret_to=ret_to,
                     sim_kwargs={'resolves': "%s" % old_name}
                 )
             else:
@@ -2297,7 +2312,7 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
             else:
                 # Got a SimSolverModeError in symbolic mode. We are screwed.
                 # Skip this IRSB
-                l.debug("Caught a SimIRSBError. Don't panic, this is usually expected.", ex)
+                l.debug("Caught a SimIRSBError %s. Don't panic, this is usually expected.", ex)
                 error_occurred = True
                 sim_run = \
                     simuvex.procedures.SimProcedures["stubs"]["PathTerminator"](
@@ -2445,13 +2460,9 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
         """
 
         # Determine whether this is a syscall
-        if isinstance(simrun, simuvex.procedures.syscalls.handler.handler):
+        if isinstance(simrun, simuvex.SimProcedure) and simrun.IS_SYSCALL is True:
             is_syscall = True
-            if simrun.syscall is not None:
-                syscall = simrun.syscall.__class__.__name__
-            else:
-                # Unsupported syscalls
-                syscall = None
+            syscall = simrun.__class__.__name__
         else:
             is_syscall = False
             syscall = None
@@ -2462,7 +2473,7 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
                 simproc_name = simrun.resolves
 
             no_ret = False
-            if (syscall is None and simrun.NO_RET) or (syscall is not None and simrun.syscall.NO_RET):
+            if syscall is not None and simrun.NO_RET:
                 no_ret = True
 
             cfg_node = CFGNode(simrun.addr,
@@ -2607,135 +2618,6 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
 
             # Set the calling convention
             func.call_convention = func._match_cc()
-
-    def _analyze_function_features(self):
-        """
-        For each function in the function_manager, try to determine if it returns or not. A function does not return if
-        it calls another function that is known to be not returning, and this function does not have other exits.
-
-        We might as well analyze other features of functions in the future.
-        """
-
-        changes = {
-            'functions_return': [],
-            'functions_do_not_return': []
-        }
-
-        for func in self.kb.functions.values():
-            if func.returning is not None:
-                # It has been determined before. Skip it
-                continue
-
-            # If there is at least one endpoint, then this function is definitely returning
-            if func.endpoints:
-                changes['functions_return'].append(func)
-                func.returning = True
-                continue
-
-            # This function does not have endpoints. It's either because it does not return, or we haven't analyzed all
-            # blocks of it.
-
-            # Let's first see if it's a known SimProcedure that does not return
-            if self.project.is_hooked(func.addr):
-                hooker = self.project.hooked_by(func.addr)
-                if hasattr(hooker, 'NO_RET') and hooker.NO_RET:
-                    func.returning = False
-                    changes['functions_do_not_return'].append(func)
-                    continue
-
-            tmp_graph = networkx.DiGraph(func.graph)
-            # Remove all fakeret edges from a non-returning function
-            edges_to_remove = [ ]
-            for src, dst, data in tmp_graph.edges_iter(data=True):
-                if data['type'] == 'fake_return':
-                    edges = [ edge for edge in func.transition_graph.edges(
-                                                nbunch=[src], data=True
-                                                ) if edge[2]['type'] != 'fake_return'
-                              ]
-                    if not edges:
-                        # We don't know which function it's supposed to call
-                        # skip
-                        continue
-                    target_addr = edges[0][1].addr
-                    target_func = self.kb.functions.function(addr=target_addr)
-                    if target_func.returning is False:
-                        edges_to_remove.append((src, dst))
-
-            for src, dst in edges_to_remove:
-                tmp_graph.remove_edge(src, dst)
-
-            # We check all its current nodes in transition graph whose out degree is 0 (call them
-            # temporary endpoints)
-            temporary_local_endpoints = [a for a in tmp_graph.nodes()
-                                         if tmp_graph.out_degree(a) == 0]
-
-            if not temporary_local_endpoints:
-                # It might be empty if our transition graph is fucked up (for example, the freaking
-                # SimProcedureContinuation can be used in any SimProcedure and almost always creates loops in its
-                # transition graph). Just ignore it.
-                continue
-
-            all_endpoints_returning = []
-            temporary_endpoints = []
-
-            for local_endpoint in temporary_local_endpoints:
-
-                if local_endpoint in func.transition_graph.nodes():
-                    out_edges = func.transition_graph.out_edges([local_endpoint], data=True)
-
-                    if not out_edges:
-                        temporary_endpoints.append(local_endpoint)
-
-                    else:
-                        for src, dst, data in out_edges:
-                            t = data['type']
-
-                            if t != 'fake_return':
-                                temporary_endpoints.append(dst)
-
-            for endpoint in temporary_endpoints:
-                if endpoint in func.nodes:
-                    # Somehow analysis terminated here (e.g. an unsupported instruction, or it doesn't generate an exit)
-
-                    if isinstance(endpoint, Function):
-                        all_endpoints_returning.append(endpoint.returning)
-
-                    else:
-                        successors = [ dst for _, dst in func.transition_graph.out_edges(endpoint) ]
-                        all_noret = True
-                        for suc in successors:
-                            if isinstance(suc, Function):
-                                if suc.returning is not False:
-                                    all_noret = False
-                            else:
-                                n = self.get_any_node(endpoint.addr, is_syscall=func.is_syscall)
-                                if n:
-                                    # It might be a SimProcedure or a syscall, or even a normal block
-                                    if n.no_ret is not True:
-                                        all_noret = False
-
-                        if all_noret:
-                            all_endpoints_returning.append(True)
-                        else:
-                            all_endpoints_returning.append(None)
-
-                else:
-                    # This block is not a member of the current function
-                    call_target = endpoint
-
-                    call_target_func = self.kb.functions.function(call_target)
-                    if call_target_func is None:
-                        all_endpoints_returning.append(None)
-                        continue
-
-                    all_endpoints_returning.append(call_target_func.returning)
-
-            if all([i is False for i in all_endpoints_returning]):
-                # All target functions that this function calls is not returning
-                func.returning = False
-                changes['functions_do_not_return'].append(func)
-
-        return changes
 
     def _refine_function_arguments(self, func, callsites):
         """
@@ -3028,7 +2910,4 @@ class CFGAccurate(Analysis, ForwardAnalysis, CFGBase):
                     self._quasi_topological_order[n] = ctr
                     ctr -= 1
 
-CFG = CFGAccurate
-
-register_analysis(CFGAccurate, 'CFG')
 register_analysis(CFGAccurate, 'CFGAccurate')

@@ -41,7 +41,8 @@ class CFGNode(object):
         if function_address and self.name is None:
             self.name = cfg.project.loader.find_symbol_name(function_address)
             if self.name is not None:
-                self.name = "%s+0x%x" % (self.name, (addr - function_address))
+                offset = addr - function_address
+                self.name = "%s%+#x" % (self.name, offset)
 
         # If this CFG contains an Ijk_Call, `return_target` stores the returning site.
         # Note: this is regardless of whether the call returns or not. You should always check the `no_ret` property if

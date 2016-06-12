@@ -1,15 +1,25 @@
 import networkx
 import logging
+
+from cle import ELF, PE
+
+from ..knowledge import Function, HookNode
+from ..analysis import Analysis
 from ..errors import AngrCFGError
 
 l = logging.getLogger(name="angr.cfg_base")
 
-class CFGBase(object):
+class CFGBase(Analysis):
     """
     The base class for control flow graphs.
     """
-    def __init__(self, project, context_sensitivity_level):
-        self._project = project
+    def __init__(self, context_sensitivity_level):
+
+        self._context_sensitivity_level=context_sensitivity_level
+
+        # Sanity checks
+        if context_sensitivity_level < 0:
+            raise ValueError("Unsupported context sensitivity level %d" % context_sensitivity_level)
 
         # Initialization
         self._graph = None
@@ -18,9 +28,10 @@ class CFGBase(object):
         self._loop_back_edges = None
         self._overlapped_loop_headers = None
         self._thumb_addrs = set()
-        if context_sensitivity_level < 0:
-            raise Exception("Unsupported context sensitivity level %d" % context_sensitivity_level)
-        self._context_sensitivity_level=context_sensitivity_level
+
+        # Store all the functions analyzed before the set is cleared
+        # Used for performance optimization
+        self._changed_functions = None
 
     def __contains__(self, cfg_node):
         return cfg_node in self._graph
@@ -37,13 +48,10 @@ class CFGBase(object):
 
     # pylint: disable=no-self-use
     def copy(self):
-        raise Exception("Not implemented.")
-
-    def _construct(self):
-        raise Exception("Not implemented")
+        raise NotImplementedError()
 
     def output(self):
-        raise Exception("Not implemented")
+        raise NotImplementedError()
 
     # TODO: Mark as deprecated
     def get_bbl_dict(self):
@@ -163,7 +171,7 @@ class CFGBase(object):
                 'You should save the input state when generating the CFG if you want to retrieve the SimIRSB later.')
 
         # Recreate the SimIRSB
-        return self._project.factory.sim_run(cfg_node.input_state)
+        return self.project.factory.sim_run(cfg_node.input_state)
 
     def irsb_from_node(self, cfg_node):
         """
@@ -183,10 +191,11 @@ class CFGBase(object):
 
     def get_all_nodes(self, addr, is_syscall=None):
         """
-        Get all CFGNodes whose address is the specified one,
-        :param addr: Address of the node
+        Get all CFGNodes whose address is the specified one.
+
+        :param addr:       Address of the node
         :param is_syscall: True returns the syscall node, False returns the normal CFGNode, None returns both
-        :return: all CFGNodes
+        :return:           all CFGNodes
         """
         results = [ ]
 
@@ -261,3 +270,220 @@ class CFGBase(object):
     def is_thumb_addr(self, addr):
         return addr in self._thumb_addrs
 
+    def _executable_memory_regions(self, binary=None, force_segment=False):
+        """
+        Get all executable memory regions from the binaries
+
+        :param binary: Binary object to collect regions from. If None, regions from all project binary objects are used.
+        :param bool force_segment: Rely on binary segments instead of sections.
+        :return: A sorted list of tuples (beginning_address, end_address)
+        """
+
+        if binary is None:
+            binaries = self.project.loader.all_objects
+        else:
+            binaries = [ binary ]
+
+        memory_regions = [ ]
+
+        for b in binaries:
+            rebase_addr = b.rebase_addr
+
+            if isinstance(b, ELF):
+                # If we have sections, we get result from sections
+                if not force_segment and b.sections:
+                    # Get all executable sections
+                    for section in b.sections:
+                        if section.is_executable:
+                            tpl = (rebase_addr + section.min_addr, rebase_addr + section.max_addr)
+                            memory_regions.append(tpl)
+
+                else:
+                    # Get all executable segments
+                    for segment in b.segments:
+                        if segment.is_executable:
+                            tpl = (rebase_addr + segment.min_addr, rebase_addr + segment.max_addr)
+                            memory_regions.append(tpl)
+
+            elif isinstance(b, PE):
+                for section in b.sections:
+                    if section.is_executable:
+                        tpl = (rebase_addr + section.min_addr, rebase_addr + section.max_addr)
+                        memory_regions.append(tpl)
+
+        if not memory_regions:
+            memory_regions = [
+                (b.rebase_addr + start, b.rebase_addr + start + len(cbacker))
+                for start, cbacker in self.project.loader.memory.cbackers
+                ]
+
+        memory_regions = sorted(memory_regions, key=lambda x: x[0])
+
+        return memory_regions
+
+    #
+    # Analyze function features
+    #
+
+    def _analyze_function_features(self):
+        """
+        For each function in the function_manager, try to determine if it returns or not. A function does not return if
+        it calls another function that is known to be not returning, and this function does not have other exits.
+
+        We might as well analyze other features of functions in the future.
+        """
+
+        changes = {
+            'functions_return': [],
+            'functions_do_not_return': []
+        }
+
+        if self._changed_functions is not None:
+            all_functions = self._changed_functions
+            caller_functions = set()
+
+            for func_addr in self._changed_functions:
+                if func_addr not in self.kb.functions.callgraph:
+                    continue
+                callers = self.kb.functions.callgraph.predecessors(func_addr)
+                for f in callers:
+                    caller_functions.add(f)
+
+            all_functions |= caller_functions
+
+            all_functions = [ self.kb.functions.function(addr=f) for f in all_functions ]
+
+        else:
+            all_functions = self.kb.functions.values()
+
+        for func in all_functions:
+            if func.returning is not None:
+                # It has been determined before. Skip it
+                continue
+
+            # If there is at least one endpoint, then this function is definitely returning
+            if func.endpoints:
+                changes['functions_return'].append(func)
+                func.returning = True
+                continue
+
+            # This function does not have endpoints. It's either because it does not return, or we haven't analyzed all
+            # blocks of it.
+
+            # Let's first see if it's a known SimProcedure that does not return
+            if self.project.is_hooked(func.addr):
+                hooker = self.project.hooked_by(func.addr)
+                if hasattr(hooker, 'NO_RET'):
+                    if hooker.NO_RET:
+                        func.returning = False
+                        changes['functions_do_not_return'].append(func)
+                    else:
+                        func.returning = True
+                        changes['functions_return'].append(func)
+                    continue
+
+            tmp_graph = networkx.DiGraph(func.graph)
+            # Remove all fakeret edges from a non-returning function
+            edges_to_remove = [ ]
+            for src, dst, data in tmp_graph.edges_iter(data=True):
+                if data['type'] == 'fake_return':
+                    edges = [ edge for edge in func.transition_graph.edges(
+                                                nbunch=[src], data=True
+                                                ) if edge[2]['type'] != 'fake_return'
+                              ]
+                    if not edges:
+                        # We don't know which function it's supposed to call
+                        # skip
+                        continue
+                    target_addr = edges[0][1].addr
+                    target_func = self.kb.functions.function(addr=target_addr)
+                    if target_func.returning is False:
+                        edges_to_remove.append((src, dst))
+
+            for src, dst in edges_to_remove:
+                tmp_graph.remove_edge(src, dst)
+
+            # We check all its current nodes in transition graph whose out degree is 0 (call them
+            # temporary endpoints)
+            temporary_local_endpoints = [a for a in tmp_graph.nodes()
+                                         if tmp_graph.out_degree(a) == 0]
+
+            if not temporary_local_endpoints:
+                # It might be empty if our transition graph is fucked up (for example, the freaking
+                # SimProcedureContinuation can be used in any SimProcedure and almost always creates loops in its
+                # transition graph). Just ignore it.
+                continue
+
+            all_endpoints_returning = []
+            temporary_endpoints = []
+
+            for local_endpoint in temporary_local_endpoints:
+
+                if local_endpoint in func.transition_graph.nodes():
+
+                    in_edges = func.transition_graph.in_edges([local_endpoint], data=True)
+                    transition_type = None if not in_edges else in_edges[0][2]['type']
+
+                    out_edges = func.transition_graph.out_edges([local_endpoint], data=True)
+
+                    if not out_edges:
+                        temporary_endpoints.append((transition_type, local_endpoint))
+
+                    else:
+                        for src, dst, data in out_edges:
+                            t = data['type']
+
+                            if t != 'fake_return':
+                                temporary_endpoints.append((transition_type, dst))
+
+            for transition_type, endpoint in temporary_endpoints:
+                if endpoint in func.nodes:
+                    # Somehow analysis terminated here (e.g. an unsupported instruction, or it doesn't generate an exit)
+
+                    if isinstance(endpoint, Function):
+                        all_endpoints_returning.append((transition_type, endpoint.returning))
+
+                    elif isinstance(endpoint, HookNode):
+                        hooker = self.project.hooked_by(endpoint.addr)
+                        all_endpoints_returning.append((transition_type, not hooker.NO_RET))
+
+                    else:
+                        successors = [ dst for _, dst in func.transition_graph.out_edges(endpoint) ]
+                        all_noret = True
+                        for suc in successors:
+                            if isinstance(suc, Function):
+                                if suc.returning is not False:
+                                    all_noret = False
+                            else:
+                                n = self.get_any_node(endpoint.addr, is_syscall=func.is_syscall)
+                                if n:
+                                    # It might be a SimProcedure or a syscall, or even a normal block
+                                    if n.no_ret is not True:
+                                        all_noret = False
+
+                        if all_noret:
+                            all_endpoints_returning.append((transition_type, True))
+                        else:
+                            all_endpoints_returning.append((transition_type, None))
+
+                else:
+                    # This block is not a member of the current function
+                    call_target = endpoint
+
+                    call_target_func = self.kb.functions.function(call_target)
+                    if call_target_func is None:
+                        all_endpoints_returning.append(None)
+                        continue
+
+                    all_endpoints_returning.append(call_target_func.returning)
+
+            if all([i is False for _, i in all_endpoints_returning]):
+                # All target functions that this function calls is not returning
+                func.returning = False
+                changes['functions_do_not_return'].append(func)
+
+            if all_endpoints_returning and all([ tpl == ("transition", True) for tpl in all_endpoints_returning ]):
+                func.returning = True
+                changes['functions_return'].append(func)
+
+        return changes

@@ -134,6 +134,8 @@ class Project(object):
         self._ignore_functions = ignore_functions
         self._extern_obj = AngrExternObject(self.arch)
         self.loader.add_object(self._extern_obj)
+        self._syscall_obj = AngrExternObject(self.arch)
+        self.loader.add_object(self._syscall_obj)
 
         self._cfg = None
         self._vfg = None
@@ -220,9 +222,9 @@ class Project(object):
                 elif not func.resolved and func.name in obj.jmprel:
                     unresolved.append(func)
 
-        # Step 3: Stub out unresolved symbols
-        # This is in the form of a simprocedure that either doesn't return
-        # or returns an unconstrained value
+            # Step 3: Stub out unresolved symbols
+            # This is in the form of a SimProcedure that either doesn't return
+            # or returns an unconstrained value
             for func in unresolved:
                 # Don't touch weakly bound symbols, they are allowed to go unresolved
                 if func.is_weak:
@@ -253,13 +255,13 @@ class Project(object):
         """
         Hook a section of code with a custom function.
 
-        If func is a function, it takes a `SimState` and the given kwargs. It can return None, in which case it
-        will generate a single exit to the instruction at addr+length, or it can return an array of successor states.
+        If `func` is a function, it takes a :class:`SimState` and the given `kwargs`. It can return None, in which case
+        it will generate a single exit to the instruction at ``addr+length``, or it can return an array of successor
+        states.
 
-        If func is a `SimProcedure`, it will be run instead of a `SimBlock` at that address.
+        If func is a :class:`SimProcedure`, it will be run instead of a :class:`SimBlock` at that address.
 
-        If length is zero, the block at the hooked address will be executed immediately after the hook function.
-
+        If `length` is zero the block at the hooked address will be executed immediately after the hook function.
 
         :param addr:        The address to hook.
         :param func:        The function that will perform an action when execution reaches the hooked address.
@@ -268,11 +270,11 @@ class Project(object):
                             :class:`SimProcedure`'s run function.
         """
 
-        if self.is_hooked(addr):
-            l.warning("Address is already hooked [hook(%#x, %s, %s()]", addr, func, kwargs.get('funcname'))
-            return
-
         if kwargs is None: kwargs = {}
+
+        if self.is_hooked(addr):
+            l.warning("Address is already hooked [hook(%#x, %s, %s()]", addr, func, kwargs.get('funcname', func.__name__))
+            return
 
         if isinstance(func, type):
             proc = func
@@ -358,6 +360,7 @@ class Project(object):
 
         self.loader.provide_symbol(self._extern_obj, symbol_name, pseudo_vaddr)
 
+        return pseudo_vaddr
     #
     # Pickling
     #

@@ -1,5 +1,5 @@
 before_script:
-    - angr-test sync hard
+    - which angr-test && angr-test sync hard
 
 ### local
 angr:
@@ -35,10 +35,29 @@ rex:
     script: "angr-test rex"
     tags: [angr]
 
+colorguard:
+    script: "angr-test colorguard"
+    tags: [angr]
+
 pwnrex:
     script: "angr-test pwnrex"
+    tags: [angr]
+
+patcherex:
+    script: "angr-test patcherex"
     tags: [angr]
 
 docs:
     script: "angr-test docs"
     tags: [angr]
+
+### Deploy stage
+
+build_images:
+    only: ["master"]
+    stage: deploy
+    script:
+    - angr-build angr
+    - angr-build angr-ci
+    - cgc-build worker
+    tags: ["docker-builder"]

@@ -34,6 +34,9 @@ class PathUnreachableError(AngrError):
 class AngrBladeError(AngrError):
     pass
 
+class AngrBladeSimProcError(AngrBladeError):
+    pass
+
 class AngrAnnotatedCFGError(AngrError):
     pass
 
@@ -47,6 +50,9 @@ class AngrCallableError(AngrSurveyorError):
     pass
 
 class AngrCallableMultistateError(AngrCallableError):
+    pass
+
+class AngrUnsupportedSyscallError(AngrError):
     pass
 
 #

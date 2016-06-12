@@ -12,10 +12,11 @@ import mulpyplexer
 
 UNAVAILABLE_RET_ADDR = -1
 
+
 class CallFrame(object):
     """
     Stores the address of the function you're in and the value of SP
-    at the VERY BOTTOM of the stack, i.e. points to the return address
+    at the VERY BOTTOM of the stack, i.e. points to the return address.
     """
     def __init__(self, state=None, func_addr=None, stack_ptr=None, ret_addr=None, jumpkind=None):
         """
@@ -23,8 +24,12 @@ class CallFrame(object):
         stack pointer, and return address
         """
         if state is not None:
-            self.func_addr = state.se.any_int(state.ip)
-            self.stack_ptr = state.se.any_int(state.regs.sp)
+            try:
+                self.func_addr = state.se.any_int(state.ip)
+                self.stack_ptr = state.se.any_int(state.regs.sp)
+            except (simuvex.SimUnsatError, simuvex.SimSolverModeError):
+                self.func_addr = None
+                self.stack_ptr = None
 
             if state.arch.call_pushes_ret:
                 self.ret_addr = state.memory.load(state.regs.sp, state.arch.bits/8, endness=state.arch.memory_endness)
@@ -57,22 +62,34 @@ class CallFrame(object):
         c.block_counter = collections.Counter(self.block_counter)
         return c
 
+
 class CallStack(object):
+    """
+    Represents a call stack.
+    """
     def __init__(self):
         self._callstack = []
 
     def __iter__(self):
         """
         Iterate through the callstack, from top to bottom
-        (most recent first)
+        (most recent first).
         """
         for cf in reversed(self._callstack):
             yield cf
 
     def push(self, cf):
+        """
+        Push the :class:`CallFrame` `cf` on the callstack.
+        """
         self._callstack.append(cf)
 
     def pop(self):
+        """
+        Pops one :class:`CallFrame` from the callstack.
+
+        :return: A CallFrame.
+        """
         try:
             return self._callstack.pop(-1)
         except IndexError:
@@ -80,6 +97,11 @@ class CallStack(object):
 
     @property
     def top(self):
+        """
+        Returns the element at the top of the callstack without removing it.
+
+        :return: A CallFrame.
+        """
         try:
             return self._callstack[-1]
         except IndexError:
@@ -125,9 +147,11 @@ class CallStack(object):
         c._callstack = [cf.copy() for cf in self._callstack]
         return c
 
+
 class ReverseListProxy(list):
     def __iter__(self):
         return reversed(self)
+
 
 class PathHistory(object):
     def __init__(self, parent=None):
@@ -141,18 +165,36 @@ class PathHistory(object):
 
     __slots__ = ('_parent', 'addr', '_runstr', '_target', '_guard', '_jumpkind', '_events')
 
+    def __getstate__(self):
+        attributes = ('addr', '_runstr', '_target', '_guard', '_jumpkind', '_events')
+        state = {name: getattr(self,name) for name in attributes}
+        return state
+
+    def __setstate__(self, state):
+        for name, value in state.iteritems():
+            setattr(self,name,value)
+            
     def _record_state(self, state, events=None):
         self._events = events if events is not None else state.log.events
-        self.addr = state.scratch.bbl_addr
         self._jumpkind = state.scratch.jumpkind
         self._target = state.scratch.target
         self._guard = state.scratch.guard
+
+        self.addr = state.scratch.bbl_addr
+        # state.scratch.bbl_addr may not be initialized (when SimProcedures are executed, for example). We need to get
+        # the value from _target in that case.
+        if self.addr is None and not self._target.symbolic:
+            self.addr = self._target._model_concrete.value
 
         if simuvex.o.TRACK_ACTION_HISTORY not in state.options:
             self._events = weakref.proxy(self._events)
 
     def _record_run(self, run):
         self._runstr = str(run)
+
+    @property
+    def _actions(self):
+        return [ ev for ev in self._events if isinstance(ev, simuvex.SimAction) ]
 
     def copy(self):
         c = PathHistory(parent=self._parent)
@@ -303,9 +345,8 @@ class ActionIter(TreeIter):
     def __reversed__(self):
         for hist in self._iter_nodes():
             try:
-                for ev in iter(hist._events):
-                    if isinstance(ev, simuvex.SimAction):
-                        yield ev
+                for ev in iter(hist._actions):
+                    yield ev
             except ReferenceError:
                 hist._events = ()
 
@@ -407,6 +448,10 @@ class Path(object):
     def addr(self):
         return self.state.se.any_int(self.state.regs.ip)
 
+    @addr.setter
+    def addr(self, val):
+        self.state.regs.ip = val
+
     def __len__(self):
         return self.length
 
@@ -480,8 +525,8 @@ class Path(object):
         """
         This function clear the execution status.
 
-        After calling this if you call step() successors will be recomputed. If you changed something into path state
-        you probably want to call this method.
+        After calling this if you call :func:`step`, successors will be recomputed. If you changed something into path
+        state you probably want to call this method.
         """
         self._run = None
 
@@ -500,6 +545,7 @@ class Path(object):
 
     @property
     def next_run(self):
+        # TODO: this should be documented.
         if self._run_error:
             return None
         if not self._run:
@@ -710,7 +756,7 @@ class Path(object):
         Returns a merger of this path with `*others`.
         """
         all_paths = list(others) + [ self ]
-        if len(set([ o.addr for o in all_paths])) != 1:
+        if len(set(( o.addr for o in all_paths))) != 1:
             raise AngrPathError("Unable to merge paths.")
 
         # merge the state
@@ -720,7 +766,14 @@ class Path(object):
         addr_lists = [x.addr_trace.hardcopy for x in all_paths]
 
         # fix the traces
-        divergence_index = [ len(set(addrs)) == 1 for addrs in zip(*addr_lists) ].index(False)
+        for i, addrs in enumerate(zip(*addr_lists)):
+            if len(frozenset(addrs)) != 1:
+                divergence_index = i
+                break
+        else:
+            # divergence either happens at the end of the shortest history or doesn't at all
+            divergence_index = i + 1
+
         rewind_count = len(addr_lists[0]) - divergence_index
         common_ancestor = all_paths[0].history
         for _ in xrange(rewind_count):
@@ -869,7 +922,14 @@ class Path(object):
     def __repr__(self):
         return "<Path with %d runs (at 0x%x)>" % (self.length, self.addr)
 
+
 class ErroredPath(Path):
+    """
+    ErroredPath is used for paths that have encountered and error in their symbolic execution. This kind of path cannot
+    be stepped further.
+
+    :ivar error:    The error that was encountered.
+    """
     def __init__(self, error, *args, **kwargs):
         super(ErroredPath, self).__init__(*args, **kwargs)
         self.error = error
@@ -893,7 +953,7 @@ def make_path(project, runs):
     """
     A helper function to generate a correct angr.Path from a list of runs corresponding to a program path.
 
-    :param runs:    A list of simruns corresponding to a program path.
+    :param runs:    A list of SimRuns corresponding to a program path.
     """
 
     if len(runs) == 0:

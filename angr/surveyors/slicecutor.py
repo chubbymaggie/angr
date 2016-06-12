@@ -53,7 +53,8 @@ class HappyGraph(object):
 class Slicecutor(Surveyor):
     """The Slicecutor is a surveyor that executes provided code slices."""
 
-    def __init__(self, project, annotated_cfg, start=None, targets=None, max_concurrency=None, max_active=None, max_loop_iterations=None, pickle_paths=None, merge_countdown=10):
+    def __init__(self, project, annotated_cfg, start=None, targets=None, max_concurrency=None, max_active=None,
+                 max_loop_iterations=None, pickle_paths=None, merge_countdown=10):
         Surveyor.__init__(self, project, start=start, max_concurrency=max_concurrency, max_active=max_active, pickle_paths=pickle_paths)
 
         # the loop limiter
@@ -183,6 +184,9 @@ class Slicecutor(Surveyor):
     @property
     def done(self):
         return (len(self.active) + len(self._merge_countdowns)) == 0
+
+    def _step_path(self, p):  #pylint:disable=no-self-use
+        p.step(stmt_whitelist=p.stmt_whitelist, last_stmt=p.last_stmt)
 
     def path_comparator(self, a, b):
         if a.weighted_length != b.weighted_length:

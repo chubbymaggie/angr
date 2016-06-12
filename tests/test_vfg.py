@@ -22,7 +22,7 @@ def run_vfg_0(arch):
                  use_sim_procedures=True,
                  default_analysis_mode='symbolic')
 
-    cfg = proj.analyses.CFG(context_sensitivity_level=1)
+    cfg = proj.analyses.CFGAccurate(context_sensitivity_level=1)
 
     # For this test case, OPTIMIZE_IR does not work due to the way we are widening the states: an index variable
     # directly goes to 0xffffffff, and when OPTIMIZE_IR is used, it does a signed comparison with 0x27, which
@@ -100,7 +100,7 @@ def run_vfg_1(arch):
         use_sim_procedures=True,
     )
 
-    cfg = proj.analyses.CFG()
+    cfg = proj.analyses.CFGAccurate()
     vfg = proj.analyses.VFG(cfg, function_start=0x40071d, context_sensitivity_level=10, interfunction_level=10)
 
     all_block_addresses = set([ n.addr for n in vfg.graph.nodes() ])
@@ -115,7 +115,7 @@ if __name__ == "__main__":
     # logging.getLogger("simuvex.plugins.abstract_memory").setLevel(logging.DEBUG)
     # logging.getLogger("simuvex.plugins.symbolic_memory").setLevel(logging.DEBUG)
     # logging.getLogger("angr.analyses.cfg").setLevel(logging.DEBUG)
-    # logging.getLogger("angr.analyses.vfg").setLevel(logging.DEBUG)
+    logging.getLogger("angr.analyses.vfg").setLevel(logging.DEBUG)
     # Temporarily disable the warnings of claripy backend
     # logging.getLogger("claripy.backends.backend").setLevel(logging.ERROR)
     # logging.getLogger("claripy.claripy").setLevel(logging.ERROR)
