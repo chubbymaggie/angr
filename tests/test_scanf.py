@@ -54,7 +54,6 @@ class Checker(object):
             component = self._extract_integer(s)
 
             if not self._check_func(component):
-                import ipdb; ipdb.set_trace()
                 return False
 
         return True
@@ -95,7 +94,7 @@ def run_scanf(threads):
 
 def test_scanf():
     yield run_scanf, None
-    yield run_scanf, 8
+    # yield run_scanf, 8
 
 if __name__ == "__main__":
     run_scanf(1)

@@ -1,5 +1,6 @@
-from simuvex import SimIRSB, SimProcedures, SimState, BP_BEFORE, BP_AFTER
+from simuvex import SimIRSB, SimProcedures, SimUnicorn, SimState, BP_BEFORE, BP_AFTER, SimUnicornError
 from simuvex import s_options as o, s_cc
+from simuvex.s_errors import SimSegfaultError, SimReliftException
 from .surveyors.caller import Callable
 
 import logging
@@ -13,6 +14,7 @@ class AngrObjectFactory(object):
         self._project = project
         self._lifter = Lifter(project, cache=translation_cache)
         self.block = self._lifter.lift
+        self.fresh_block = self._lifter.fresh_block
         self._default_cc = s_cc.DefaultCC[project.arch.name]
 
     def snippet(self, addr, jumpkind=None, **block_opts):
@@ -50,6 +52,17 @@ class AngrObjectFactory(object):
         if addr is None:
             addr = state.se.any_int(state.regs.ip)
 
+        if o.STRICT_PAGE_ACCESS in state.options:
+            try:
+                perms = state.memory.permissions(addr)
+            except KeyError:
+                raise SimSegfaultError(addr, 'exec-miss')
+            else:
+                if not perms.symbolic:
+                    perms = perms.args[0]
+                    if not perms & 4:
+                        raise SimSegfaultError(addr, 'non-executable')
+
         thumb = False
         if addr % state.arch.instruction_alignment != 0:
             if state.thumb:
@@ -62,22 +75,37 @@ class AngrObjectFactory(object):
 
         if opt_level is None:
             opt_level = 1 if o.OPTIMIZE_IR in state.options else 0
-        backup_state = state if self._project._support_selfmodifying_code else None
 
-        bb = self.block(addr,
-                        arch=state.arch,
-                        opt_level=opt_level,
-                        thumb=thumb,
-                        backup_state=backup_state,
-                        **block_opts)
+        force_bbl_addr = block_opts.pop('force_bbl_addr', None)
 
-        return SimIRSB(state,
-                       bb.vex,
-                       addr=addr,
-                       whitelist=stmt_whitelist,
-                       last_stmt=last_stmt)
+        while True:
+            bb = self.block(addr,
+                            arch=state.arch,
+                            opt_level=opt_level,
+                            thumb=thumb,
+                            backup_state=state,
+                            **block_opts)
 
-    def sim_run(self, state, addr=None, jumpkind=None, **block_opts):
+            try:
+                return SimIRSB(state,
+                               bb.vex,
+                               addr=addr,
+                               whitelist=stmt_whitelist,
+                               last_stmt=last_stmt,
+                               force_bbl_addr=force_bbl_addr)
+            except SimReliftException as e:
+                state = e.state
+                force_bbl_addr = state.scratch.bbl_addr
+                if 'insn_bytes' in block_opts:
+                    raise AngrValueError("You cannot pass self-modifying code as insn_bytes!!!")
+                new_ip = state.scratch.ins_addr
+                if 'max_size' in block_opts:
+                    block_opts['max_size'] -= new_ip - addr
+                if 'num_inst' in block_opts:
+                    block_opts['num_inst'] -= state.scratch.num_insns
+                addr = new_ip
+
+    def sim_run(self, state, addr=None, jumpkind=None, extra_stop_points=None, **block_opts):
         """
         Returns a simuvex SimRun object (supporting refs() and exits()), automatically choosing whether to create a
         SimIRSB or a SimProcedure.
@@ -88,15 +116,16 @@ class AngrObjectFactory(object):
 
         Additional keyword arguments will be passed directly into factory.sim_block if appropriate.
 
-        :keyword stmt_whitelist:    a list of stmt indexes to which to confine execution.
-        :keyword last_stmt:         a statement index at which to stop execution.
-        :keyword thumb:             whether the block should be lifted in ARM's THUMB mode.
-        :keyword backup_state:      a state to read bytes from instead of using project memory.
-        :keyword opt_level:         the VEX optimization level to use.
-        :keyword insn_bytes:        a string of bytes to use for the block instead of the project.
-        :keyword max_size:          the maximum size of the block, in bytes.
-        :keyword num_inst:          the maximum number of instructions.
-        :keyword traceflags:        traceflags to be passed to VEX. Default: 0
+        :param stmt_whitelist:    a list of stmt indexes to which to confine execution.
+        :param last_stmt:         a statement index at which to stop execution.
+        :param thumb:             whether the block should be lifted in ARM's THUMB mode.
+        :param backup_state:      a state to read bytes from instead of using project memory.
+        :param opt_level:         the VEX optimization level to use.
+        :param insn_bytes:        a string of bytes to use for the block instead of the project.
+        :param max_size:          the maximum size of the block, in bytes.
+        :param num_inst:          the maximum number of instructions.
+        :param extra_stop_points: addresses to stop at, other than hooked functions
+        :param traceflags:        traceflags to be passed to VEX. Default: 0
         """
 
         if addr is None:
@@ -128,9 +157,24 @@ class AngrObjectFactory(object):
             state._inspect('call', BP_AFTER, function_name=sim_proc_class.__name__)
             l.debug("... %s created", r)
 
+        elif o.UNICORN in state.options and state.unicorn.check():
+            l.info('Creating SimUnicorn at %#x', addr)
+            stops = self._project._sim_procedures.keys()
+            if extra_stop_points is not None:
+                stops.extend(extra_stop_points)
+
+            try:
+                r = SimUnicorn(state, stop_points=stops)
+            except SimUnicornError:
+                r = self.sim_block(state, **block_opts)
+
         else:
-            l.debug("Creating SimIRSB at %#x", addr)
+            l.debug("Creating SimIRSB at 0x%x", addr)
             r = self.sim_block(state, addr=addr, **block_opts)
+
+        # Peek and fix the IP for syscalls
+        if r.successors and r.successors[0].scratch.jumpkind.startswith('Ijk_Sys'):
+            self._fix_syscall_ip(r.successors[0])
 
         return r
 
@@ -343,8 +387,31 @@ class AngrObjectFactory(object):
     call_state.PointerWrapper = s_cc.PointerWrapper
 
 
+    #
+    # Private methods
+    #
+
+    def _fix_syscall_ip(self, state):
+        """
+        Resolve syscall information from the state, get the IP address of the syscall SimProcedure, and set the IP of
+        the state accordingly. Don't do anything if the resolution fails.
+
+        :param simuvex.s_state.SimState state: the program state.
+        :return: None
+        """
+
+        try:
+            _, syscall_addr, _, _ = self._project._simos.syscall_info(state)
+
+            # Fix the IP
+            state.ip = syscall_addr
+
+        except AngrUnsupportedSyscallError:
+            # the syscall is not supported. don't do anything
+            pass
+
 from .lifter import Lifter
-from .errors import AngrExitError, AngrError, AngrValueError
+from .errors import AngrExitError, AngrError, AngrValueError, AngrUnsupportedSyscallError
 from .path import Path
 from .path_group import PathGroup
 from .knowledge import HookNode

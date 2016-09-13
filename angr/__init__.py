@@ -1,4 +1,4 @@
-""" Angr module """
+""" angr module """
 # pylint: disable=wildcard-import
 
 import logging
@@ -20,6 +20,7 @@ from .path_group import PathGroup
 from .surveyors.caller import Callable
 from .log import Loggers
 from . import knowledge
+from . import exploration_techniques
 
 import sys
 i = 0

@@ -1,11 +1,11 @@
+from os import urandom
 import copy
 import logging
-import weakref
+import collections
 l = logging.getLogger("angr.path")
 
-from os import urandom
-import collections
-
+import simuvex
+import claripy
 import mulpyplexer
 
 #pylint:disable=unidiomatic-typecheck
@@ -23,6 +23,9 @@ class CallFrame(object):
         Initialize with either a state or the function address,
         stack pointer, and return address
         """
+
+        self.jumpkind = jumpkind if jumpkind is not None else (state.scratch.jumpkind if state is not None else None)
+
         if state is not None:
             try:
                 self.func_addr = state.se.any_int(state.ip)
@@ -31,10 +34,17 @@ class CallFrame(object):
                 self.func_addr = None
                 self.stack_ptr = None
 
-            if state.arch.call_pushes_ret:
-                self.ret_addr = state.memory.load(state.regs.sp, state.arch.bits/8, endness=state.arch.memory_endness)
+            if self.jumpkind and self.jumpkind.startswith('Ijk_Sys'):
+                # syscalls
+                self.ret_addr = state.regs.ip_at_syscall
             else:
-                self.ret_addr = state.regs.lr
+                # calls
+                if state.arch.call_pushes_ret:
+                    self.ret_addr = state.memory.load(state.regs.sp, state.arch.bits / 8,
+                                                      endness=state.arch.memory_endness, inspect=False
+                                                      )
+                else:
+                    self.ret_addr = state.regs.lr
 
             # Try to convert the ret_addr to an integer
             try:
@@ -46,7 +56,6 @@ class CallFrame(object):
             self.stack_ptr = stack_ptr
             self.ret_addr = ret_addr
 
-        self.jumpkind = jumpkind if jumpkind is not None else (state.scratch.jumpkind if state is not None else None)
         self.block_counter = collections.Counter()
 
     def __str__(self):
@@ -153,204 +162,6 @@ class ReverseListProxy(list):
         return reversed(self)
 
 
-class PathHistory(object):
-    def __init__(self, parent=None):
-        self._parent = parent
-        self.addr = None
-        self._runstr = None
-        self._target = None
-        self._guard = None
-        self._jumpkind = None
-        self._events = ()
-
-    __slots__ = ('_parent', 'addr', '_runstr', '_target', '_guard', '_jumpkind', '_events')
-
-    def __getstate__(self):
-        attributes = ('addr', '_runstr', '_target', '_guard', '_jumpkind', '_events')
-        state = {name: getattr(self,name) for name in attributes}
-        return state
-
-    def __setstate__(self, state):
-        for name, value in state.iteritems():
-            setattr(self,name,value)
-            
-    def _record_state(self, state, events=None):
-        self._events = events if events is not None else state.log.events
-        self._jumpkind = state.scratch.jumpkind
-        self._target = state.scratch.target
-        self._guard = state.scratch.guard
-
-        self.addr = state.scratch.bbl_addr
-        # state.scratch.bbl_addr may not be initialized (when SimProcedures are executed, for example). We need to get
-        # the value from _target in that case.
-        if self.addr is None and not self._target.symbolic:
-            self.addr = self._target._model_concrete.value
-
-        if simuvex.o.TRACK_ACTION_HISTORY not in state.options:
-            self._events = weakref.proxy(self._events)
-
-    def _record_run(self, run):
-        self._runstr = str(run)
-
-    @property
-    def _actions(self):
-        return [ ev for ev in self._events if isinstance(ev, simuvex.SimAction) ]
-
-    def copy(self):
-        c = PathHistory(parent=self._parent)
-        c.addr = self.addr
-        c._runstr = self._runstr
-        c._target = self._target
-        c._guard = self._guard
-        c._jumpkind = self._jumpkind
-        c._events = self._events
-        return c
-
-    def closest_common_ancestor(self, other):
-        """
-        Find the common ancestor between this PathHistory and 'other'.
-
-        :param other:   the PathHistory to find a common ancestor with.
-        :return:        the common ancestor PathHistory, or None if there isn't one
-        """
-        our_history_iter = reversed(HistoryIter(self))
-        their_history_iter = reversed(HistoryIter(other))
-        sofar = set()
-
-        while True:
-            our_done = False
-            their_done = False
-
-            try:
-                our_next = next(our_history_iter)
-                if our_next in sofar:
-                    # we found it!
-                    return our_next
-                sofar.add(our_next)
-            except StopIteration:
-                # we ran out of items during iteration
-                our_done = True
-
-            try:
-                their_next = next(their_history_iter)
-                if their_next in sofar:
-                    # we found it!
-                    return their_next
-                sofar.add(their_next)
-            except StopIteration:
-                # we ran out of items during iteration
-                their_done = True
-
-            # if we ran out of both lists, there's no common ancestor
-            if our_done and their_done:
-                return None
-
-class TreeIter(object):
-    def __init__(self, start, end=None):
-        self._start = start
-        self._end = end
-
-    def _iter_nodes(self):
-        n = self._start
-        while n is not self._end:
-            yield n
-            n = n._parent
-
-    def __iter__(self):
-        for i in self.hardcopy:
-            yield i
-
-    def __reversed__(self):
-        raise NotImplementedError("Why are you using this class")
-
-    @property
-    def hardcopy(self):
-        # lmao
-        return list(reversed(tuple(reversed(self))))
-
-    def __len__(self):
-        return len(self.hardcopy)
-
-    def __getitem__(self, k):
-        if isinstance(k, slice):
-            raise ValueError("Please use .hardcopy to use slices")
-        if k >= 0:
-            raise ValueError("Please use .hardcopy to use nonnegative indexes")
-        i = 0
-        for item in reversed(self):
-            i -= 1
-            if i == k:
-                return item
-        raise IndexError(k)
-
-    def count(self, v):
-        """
-        Count occurrences of value v in the entire history. Note that the subclass must implement the __reversed__
-        method, otherwise an exception will be thrown.
-        :param object v: The value to look for
-        :return: The number of occurrences
-        :rtype: int
-        """
-        ctr = 0
-        for item in reversed(self):
-            if item == v:
-                ctr += 1
-        return ctr
-
-class HistoryIter(TreeIter):
-    def __reversed__(self):
-        for hist in self._iter_nodes():
-            yield hist
-
-class AddrIter(TreeIter):
-    def __reversed__(self):
-        for hist in self._iter_nodes():
-            if hist.addr is not None:
-                yield hist.addr
-
-class RunstrIter(TreeIter):
-    def __reversed__(self):
-        for hist in self._iter_nodes():
-            if hist._runstr is not None:
-                yield hist._runstr
-
-class TargetIter(TreeIter):
-    def __reversed__(self):
-        for hist in self._iter_nodes():
-            if hist._target is not None:
-                yield hist._target
-
-class GuardIter(TreeIter):
-    def __reversed__(self):
-        for hist in self._iter_nodes():
-            if hist._guard is not None:
-                yield hist._guard
-
-class JumpkindIter(TreeIter):
-    def __reversed__(self):
-        for hist in self._iter_nodes():
-            if hist._jumpkind is not None:
-                yield hist._jumpkind
-
-class EventIter(TreeIter):
-    def __reversed__(self):
-        for hist in self._iter_nodes():
-            try:
-                for ev in iter(hist._events):
-                    yield ev
-            except ReferenceError:
-                hist._events = ()
-
-class ActionIter(TreeIter):
-    def __reversed__(self):
-        for hist in self._iter_nodes():
-            try:
-                for ev in iter(hist._actions):
-                    yield ev
-            except ReferenceError:
-                hist._events = ()
-
-
 class Path(object):
     """
     A Path represents a sequence of basic blocks for an execution of the program.
@@ -368,10 +179,6 @@ class Path(object):
         self._project = project
 
         if path is None:
-            # this path's information
-            self.length = 0
-            self.extra_length = 0
-
             # the path history
             self.history = PathHistory()
             self.callstack = CallStack()
@@ -393,24 +200,15 @@ class Path(object):
 
             # the previous run
             self.previous_run = None
-            self._eref = None
+            self.history._jumpkind = state.scratch.jumpkind
 
             # A custom information store that will be passed to all its descendents
             self.info = {}
 
             # for merging
             self._upcoming_merge_points = []
-            self._merge_flags = []
-            self._merge_values = []
-            self._merge_traces = []
-            self._merge_addr_traces = []
-            self._merge_depths = []
 
         else:
-            # this path's information
-            self.length = path.length + 1
-            self.extra_length = path.extra_length
-
             # the path history
             self.history = PathHistory(path.history)
             self.callstack = path.callstack.copy()
@@ -419,8 +217,7 @@ class Path(object):
 
             # the previous run
             self.previous_run = path._run
-            self._eref = ReverseListProxy(state.log.events)
-            self.history._record_state(state, self._eref)
+            self.history._record_state(state)
             self.history._record_run(path._run)
             self._manage_callstack(state)
 
@@ -428,11 +225,6 @@ class Path(object):
             self.info = { k:copy.copy(v) for k, v in path.info.iteritems() }
 
             self._upcoming_merge_points = list(path._upcoming_merge_points)
-            self._merge_flags = list(path._merge_flags)
-            self._merge_values = list(path._merge_values)
-            self._merge_traces = list(path._merge_traces)
-            self._merge_addr_traces = list(path._merge_addr_traces)
-            self._merge_depths = list(path._merge_depths)
 
         # for printing/ID stuff and inheritance
         self.name = str(id(self))
@@ -442,7 +234,6 @@ class Path(object):
         self._run_args = None       # sim_run args, to determine caching
         self._run = None
         self._run_error = None
-        self._reachable = None
 
     @property
     def addr(self):
@@ -452,9 +243,46 @@ class Path(object):
     def addr(self, val):
         self.state.regs.ip = val
 
-    def __len__(self):
-        return self.length
+    #
+    # Pass-throughs to history
+    #
 
+    @property
+    def length(self):
+        return self.history.length
+
+    @length.setter
+    def length(self, v):
+        l.warning("Manually setting length -- change this behavior.")
+        self.history.length = v
+
+    @property
+    def extra_length(self):
+        return self.history.extra_length
+
+    @extra_length.setter
+    def extra_length(self, val):
+        self.history.extra_length = val
+
+    @property
+    def weighted_length(self):
+        return self.history.length + self.history.extra_length
+
+    @property
+    def jumpkind(self):
+        return self.history._jumpkind
+
+    @property
+    def last_actions(self):
+        return self.history.actions
+
+    #
+    # History traversal
+    #
+
+    @property
+    def history_iterator(self):
+        return HistoryIter(self.history)
     @property
     def addr_trace(self):
         return AddrIter(self.history)
@@ -476,9 +304,6 @@ class Path(object):
     @property
     def actions(self):
         return ActionIter(self.history)
-    @property
-    def last_actions(self):
-        return tuple(ev for ev in self.history._events if isinstance(ev, simuvex.SimAction))
 
     def trim_history(self):
         self.history = self.history.copy()
@@ -489,36 +314,41 @@ class Path(object):
     # Stepping methods and successor access
     #
 
-    def step(self, **run_args):
+    def step(self, throw=None, **run_args):
         """
         Step a path forward. Optionally takes any argument applicable to project.factory.sim_run.
 
-        :keyword jumpkind:          the jumpkind of the previous exit.
-        :keyword addr an address:   to execute at instead of the state's ip.
-        :keyword stmt_whitelist:    a list of stmt indexes to which to confine execution.
-        :keyword last_stmt:         a statement index at which to stop execution.
-        :keyword thumb:             whether the block should be lifted in ARM's THUMB mode.
-        :keyword backup_state:      a state to read bytes from instead of using project memory.
-        :keyword opt_level:         the VEX optimization level to use.
-        :keyword insn_bytes:        a string of bytes to use for the block instead of #the project.
-        :keyword max_size:          the maximum size of the block, in bytes.
-        :keyword num_inst:          the maximum number of instructions.
-        :keyword traceflags:        traceflags to be passed to VEX. Default: 0
+        :param jumpkind:          the jumpkind of the previous exit.
+        :param addr an address:   to execute at instead of the state's ip.
+        :param stmt_whitelist:    a list of stmt indexes to which to confine execution.
+        :param last_stmt:         a statement index at which to stop execution.
+        :param thumb:             whether the block should be lifted in ARM's THUMB mode.
+        :param backup_state:      a state to read bytes from instead of using project memory.
+        :param opt_level:         the VEX optimization level to use.
+        :param insn_bytes:        a string of bytes to use for the block instead of #the project.
+        :param max_size:          the maximum size of the block, in bytes.
+        :param num_inst:          the maximum number of instructions.
+        :param traceflags:        traceflags to be passed to VEX. Default: 0
 
         :returns:   An array of paths for the possible successors.
         """
         if self._run_args != run_args or not self._run:
             self._run_args = run_args
-            self._make_sim_run()
+            self._make_sim_run(throw=throw)
+
+        self.state._inspect('path_step', simuvex.BP_BEFORE)
 
         if self._run_error:
-            return [ ErroredPath(self._run_error, self._project, self.state.copy(), path=self) ]
+            return [ self.copy(error=self._run_error) ]
 
         out = [ Path(self._project, s, path=self) for s in self._run.flat_successors ]
-        if 'insn_bytes' in run_args and not 'addr' in run_args and len(out) == 1 \
+        if 'insn_bytes' in run_args and 'addr' not in run_args and len(out) == 1 \
                 and isinstance(self._run, simuvex.SimIRSB) \
                 and self.addr + self._run.irsb.size == out[0].state.se.any_int(out[0].state.regs.ip):
             out[0].state.regs.ip = self.addr
+
+        for p in out:
+            p.state._inspect('path_step', simuvex.BP_AFTER)
         return out
 
     def clear(self):
@@ -531,7 +361,7 @@ class Path(object):
         self._run = None
 
 
-    def _make_sim_run(self):
+    def _make_sim_run(self, throw=None):
         self._run = None
         self._run_error = None
         try:
@@ -539,9 +369,13 @@ class Path(object):
         except (AngrError, simuvex.SimError, claripy.ClaripyError) as e:
             l.debug("Catching exception", exc_info=True)
             self._run_error = e
+            if throw:
+                raise
         except (TypeError, ValueError, ArithmeticError, MemoryError) as e:
             l.debug("Catching exception", exc_info=True)
             self._run_error = e
+            if throw:
+                raise
 
     @property
     def next_run(self):
@@ -603,6 +437,17 @@ class Path(object):
     #
     # Utility functions
     #
+
+    def branch_causes(self):
+        """
+        Returns the variables that have caused this path to branch.
+
+        :return: A list of tuples of (basic block address, jmp instruction address, set(variables))
+        """
+        return [
+            (h.addr, h._jump_source, tuple(h._guard.variables)) for h in self.history_iterator
+            if h._jump_avoidable
+        ]
 
     def divergence_addr(self, other):
         """
@@ -667,15 +512,7 @@ class Path(object):
 
     @property
     def reachable(self):
-        return self._reachable if self._reachable is not None else self.state.satisfiable()
-
-    @property
-    def weighted_length(self):
-        return self.length + self.extra_length
-
-    @property
-    def jumpkind(self):
-        return self.state.scratch.jumpkind
+        return self.history.reachable()
 
     @property
     def _s0(self):
@@ -700,124 +537,157 @@ class Path(object):
         """
 
         # maintain the blockcounter stack
-        if state.scratch.jumpkind == "Ijk_Call":
-            callframe = CallFrame(state)
-            self.callstack.push(callframe)
-            self.callstack_backtrace.append((hash(self.callstack), callframe, len(self.callstack)))
-        elif state.scratch.jumpkind.startswith('Ijk_Sys'):
-            callframe = CallFrame(state)
-            self.callstack.push(callframe)
-            self.callstack_backtrace.append((hash(self.callstack), callframe, len(self.callstack)))
-        elif state.scratch.jumpkind == "Ijk_Ret":
-            self.popped_callframe = self.callstack.pop()
-            if len(self.callstack) == 0:
-                l.info("Path callstack unbalanced...")
-                self.callstack.push(CallFrame(None, 0, 0, 0))
+        if state.scratch.bbl_addr_list is not None:
+            # there are more than one block - probably from Unicorn engine
 
-        self.callstack.top.block_counter[state.scratch.bbl_addr] += 1
+            block_addr_to_jumpkind = { } # cache
+
+            for i, bbl_addr in enumerate(state.scratch.bbl_addr_list):
+
+                try:
+                    block_size, jumpkind = block_addr_to_jumpkind[bbl_addr]
+                except KeyError:
+                    if self._project.is_hooked(bbl_addr):
+                        if issubclass(self._project.hooked_by(bbl_addr), simuvex.SimProcedure):
+                            block_size = None  # it will not be used
+                            jumpkind = 'Ijk_Ret'
+                        else:
+                            block_size = None  # will not be used either
+                            jumpkind = 'Ijk_Boring'
+
+                    else:
+                        block = self._project.factory.block(bbl_addr)
+                        block_size = block.size
+                        jumpkind = block.vex.jumpkind
+
+                    block_addr_to_jumpkind[bbl_addr] = block_size, jumpkind
+
+                if jumpkind == 'Ijk_Call':
+                    if i == len(state.scratch.bbl_addr_list) - 1:
+                        self._manage_callstack_call(state)
+                    else:
+                        func_addr = state.scratch.bbl_addr_list[i + 1]
+                        stack_ptr = state.scratch.stack_pointer_list[i + 1]
+                        ret_addr = bbl_addr + block_size
+                        self._manage_callstack_call(func_addr=func_addr, stack_ptr=stack_ptr, ret_addr=ret_addr)
+
+                elif jumpkind.startswith('Ijk_Sys'):
+                    if i == len(state.scratch.bbl_addr_list) - 1:
+                        self._manage_callstack_sys(state)
+                    else:
+                        func_addr = state.scratch.bbl_addr_list[i + 1]
+                        stack_ptr = state.scratch.stack_pointer_list[i + 1]
+                        ret_addr = bbl_addr + block_size
+                        self._manage_callstack_sys(func_addr=func_addr, stack_ptr=stack_ptr, ret_addr=ret_addr,
+                                                   jumpkind=jumpkind
+                                                   )
+
+                elif jumpkind == 'Ijk_Ret':
+                    self._manage_callstack_ret()
+
+        else:
+            # there is only one block
+            if state.scratch.jumpkind == "Ijk_Call":
+                self._manage_callstack_call(state)
+
+            elif state.scratch.jumpkind.startswith('Ijk_Sys'):
+                self._manage_callstack_sys(state)
+
+            elif state.scratch.jumpkind == "Ijk_Ret":
+                self._manage_callstack_ret()
+
+            self.callstack.top.block_counter[state.scratch.bbl_addr] += 1
+
+    def _manage_callstack_call(self, state=None, func_addr=None, stack_ptr=None, ret_addr=None):
+        if state is not None:
+            callframe = CallFrame(state)
+        else:
+            callframe = CallFrame(func_addr=func_addr, stack_ptr=stack_ptr, ret_addr=ret_addr, jumpkind='Ijk_Call')
+
+        self.callstack.push(callframe)
+        self.callstack_backtrace.append((hash(self.callstack), callframe, len(self.callstack)))
+
+    def _manage_callstack_sys(self, state=None, func_addr=None, stack_ptr=None, ret_addr=None, jumpkind=None):
+        if state is not None:
+            callframe = CallFrame(state)
+        else:
+            callframe = CallFrame(func_addr=func_addr, stack_ptr=stack_ptr, ret_addr=ret_addr, jumpkind=jumpkind)
+
+        self.callstack.push(callframe)
+        self.callstack_backtrace.append((hash(self.callstack), callframe, len(self.callstack)))
+
+    def _manage_callstack_ret(self):
+        self.popped_callframe = self.callstack.pop()
+        if len(self.callstack) == 0:
+            l.info("Path callstack unbalanced...")
+            self.callstack.push(CallFrame(state=None, func_addr=0, stack_ptr=0, ret_addr=0))
 
     #
     # Merging and splitting
     #
 
-    def unmerge(self):
-        """
-        Unmerges the state back into different possible states.
-        """
-
-        l.debug("Unmerging %s!", self)
-
-        states = [ self.state ]
-
-        for flag,values in zip(self._merge_flags, self._merge_values):
-            l.debug("... processing %s with %d possibilities", flag, len(values))
-
-            new_states = [ ]
-
-            for v in values:
-                for s in states:
-                    s_copy = s.copy()
-                    s_copy.add_constraints(flag == v)
-                    new_states.append(s_copy)
-
-            states = [ s for s in new_states if s.satisfiable() ]
-            l.debug("... resulting in %d satisfiable states", len(states))
-
-        new_paths = [ ]
-        for s in states:
-            s.simplify()
-
-            p = Path(self._project, s, path=self)
-            new_paths.append(p)
-        return new_paths
-
-    def merge(self, *others):
+    def merge(*all_paths, **kwargs): #pylint:disable=no-self-argument,no-method-argument
         """
         Returns a merger of this path with `*others`.
+
+        :param *paths: the paths to merge
+        :param common_history: a PathHistory node shared by all the paths. When this is provided, the
+                               merging becomes more efficient, and actions and such are merged.
+        :returns: the merged Path
+        :rtype: Path
         """
-        all_paths = list(others) + [ self ]
+
+        common_history = kwargs.pop('common_history')
+        if len(kwargs) != 0:
+            raise ValueError("invalid arguments: %s" % kwargs.keys())
+
         if len(set(( o.addr for o in all_paths))) != 1:
             raise AngrPathError("Unable to merge paths.")
 
-        # merge the state
-        new_state, merge_flag, _ = self.state.merge(*[ o.state for o in others ])
-        new_path = Path(self._project, new_state, path=self)
+        if common_history is None:
+            raise AngrPathError("TODO: implement mergining without a provided common history")
 
-        addr_lists = [x.addr_trace.hardcopy for x in all_paths]
+        # get the different constraints
+        constraints = [ p.history.constraints_since(common_history) for p in all_paths ]
 
-        # fix the traces
-        for i, addrs in enumerate(zip(*addr_lists)):
-            if len(frozenset(addrs)) != 1:
-                divergence_index = i
-                break
-        else:
-            # divergence either happens at the end of the shortest history or doesn't at all
-            divergence_index = i + 1
+        # merge the state with these constraints
+        new_state, merge_conditions, _ = all_paths[0].state.merge(
+            *[ p.state for p in all_paths[1:] ], merge_conditions=constraints
+        )
+        new_path = Path(all_paths[0]._project, new_state, path=all_paths[0])
 
-        rewind_count = len(addr_lists[0]) - divergence_index
-        common_ancestor = all_paths[0].history
-        for _ in xrange(rewind_count):
-            common_ancestor = common_ancestor._parent
-
-        assert common_ancestor.addr == addr_lists[0][divergence_index-1]
-        new_path.history = PathHistory(common_ancestor)
-        new_path.history._runstr = "MERGE POINT: %s" % merge_flag
-        new_path.length = divergence_index
+        # fix up the new path
+        new_path.history = PathHistory(common_history)
+        new_path.history.merged_from.extend(p.history for p in all_paths)
+        new_path.history.merge_conditions = merge_conditions
+        new_path.history._record_state(new_state)
+        new_path.history._runstr = "MERGE POINT (at %#x)" % new_path.addr
+        new_path.history.length -= 1
 
         # reset the upcoming merge points
         new_path._upcoming_merge_points = []
-        new_path._merge_flags.append(merge_flag)
-        new_path._merge_values.append(list(range(len(all_paths))))
-        new_path._merge_traces.append([o.trace.hardcopy for o in all_paths])
-        new_path._merge_addr_traces.append(addr_lists)
-        new_path._merge_depths.append(new_path.length)
 
+        # and return
         return new_path
 
-    def copy(self):
-        p = Path(self._project, self.state.copy())
+    def copy(self, error=None):
+        if error is None:
+            p = Path(self._project, self.state.copy())
+        else:
+            p = ErroredPath(error, self._project, self.state.copy())
 
         p.history = self.history.copy()
-        p._eref = self._eref
         p.callstack = self.callstack.copy()
         p.callstack_backtrace = list(self.callstack_backtrace)
         p.popped_callframe = self.popped_callframe
 
 
-        p.length = self.length
-        p.extra_length = self.extra_length
         p.previous_run = self.previous_run
         p._run = self._run
 
         p.info = {k: copy.copy(v) for k, v in self.info.iteritems()}
 
         p._upcoming_merge_points = list(self._upcoming_merge_points)
-        p._merge_flags = list(self._merge_flags)
-        p._merge_values = list(self._merge_values)
-        p._merge_traces = list(self._merge_traces)
-        p._merge_addr_traces = list(self._merge_addr_traces)
-        p._merge_depths = list(self._merge_depths)
-
         return p
 
     def filter_actions(self, block_addr=None, block_stmt=None, insn_addr=None, read_from=None, write_to=None):
@@ -967,20 +837,18 @@ def make_path(project, runs):
 
     # We then go through all the nodes except the last one
     for r in runs[1:-1]:
-        a_p.history._record_state(r.initial_state, ReverseListProxy(runs[-1].initial_state.log.events))
+        a_p.history._record_state(r.initial_state)
         a_p._manage_callstack(r.initial_state)
         a_p.history = PathHistory(a_p.history)
         a_p.history._record_run(r)
 
     # We record the last state and set it as current (it is the initial
     # state of the next run).
-    a_p._eref = ReverseListProxy(runs[-1].initial_state.log.events)
-    a_p.history._record_state(runs[-1].initial_state, a_p._eref)
+    a_p.history._record_state(runs[-1].initial_state)
     a_p._manage_callstack(runs[-1].initial_state)
     a_p.state = runs[-1].initial_state
 
     return a_p
 
 from .errors import AngrError, AngrPathError
-import simuvex
-import claripy
+from .path_history import * #pylint:disable=wildcard-import,unused-wildcard-import

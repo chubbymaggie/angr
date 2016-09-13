@@ -1,25 +1,32 @@
 import nose
 import angr
+import simuvex
 
 import os
 test_location = os.path.join(os.path.dirname(os.path.realpath(str(__file__))), '../../binaries/tests/')
 
 arch_data = { # (steps, [hit addrs], finished)
     'x86_64':  (330, (0x1021c20, 0x1021980, 0x1021be0, 0x4004b0, 0x400440, 0x400570), True),  # Finishes
-    'i386':    (214, (0x90198e0, 0x90195c0, 0x9019630, 0x90198a0, 0x8048370, 0x80482f8, 0x8048440), False),  # blocked on syscalls
-    'ppc':     (197, (0x11022f50, 0x11022eb0, 0x10000340, 0x100002e8), False),  # blocked on syscalls
-    'ppc64':   (184,  (0x11047490, 0x100003fc, 0x10000368), False),     # blocked on syscalls
-    'mips':    (160, (0x1016f20, 0x400500, 0x400470), False),   # blocked on some very weird TLS initialization?
-    'mips64':  (191, (0x12103b828, 0x120000870, 0x1200007e0), False),   # blocked on syscalls
-    'armel':   (154, (0x10154b8, 0x1108244, 0x83a8, 0x8348, 0x84b0), False),     # blocked on __kuser_cmpxchg
-    'aarch64': (198, (0x1020b04, 0x400430, 0x4003b8, 0x400538), False),     # blocked on syscalls
+    'i386':    (213, (0x90198e0, 0x90195c0, 0x9019630, 0x90198a0, 0x8048370, 0x80482f8, 0x8048440), False),  # blocked on syscalls
+    'ppc':     (62,  (0x11022f50, 0x11022eb0, 0x10000340, 0x100002e8), False),  # blocked on syscalls
+    'ppc64':   (183, (0x11047490, 0x100003fc, 0x10000368), False),     # blocked on syscalls
+    'mips':    (159, (0x1016f20, 0x400500, 0x400470), False),   # blocked on some very weird TLS initialization?
+    'mips64':  (324, (0x12103b828, 0x120000870, 0x1200007e0), False),   # blocked on some io initialization
+    'armel':   (153, (0x10154b8, 0x1108244, 0x83a8, 0x8348, 0x84b0), False),     # blocked on __kuser_cmpxchg
+    'aarch64': (197, (0x1020b04, 0x400430, 0x4003b8, 0x400538), False),     # blocked on syscalls
 }
 
 def emulate(arch):
     steps, hit_addrs, finished = arch_data[arch]
     filepath = test_location + arch + '/test_arrays'
     p = angr.Project(filepath, use_sim_procedures=False)
-    state = p.factory.full_init_state(args=['./test_arrays'])
+
+    #if arch not in ('x86_64', 'i386'):
+    #    state = p.factory.full_init_state(args=['./test_arrays'])
+    #else:
+    #    state = p.factory.full_init_state(args=['./test_arrays'], add_options={simuvex.o.STRICT_PAGE_ACCESS})
+    state = p.factory.full_init_state(args=['./test_arrays'], add_options={simuvex.o.STRICT_PAGE_ACCESS, simuvex.o.CGC_ZERO_FILL_UNCONSTRAINED_MEMORY})
+
     pg = p.factory.path_group(state)
     pg2 = pg.step(until=lambda lpg: len(lpg.active) != 1,
                   step_func=lambda lpg: lpg if len(lpg.active) == 1 else lpg.prune()
@@ -59,7 +66,7 @@ def test_emulation():
 
 def test_locale():
     p = angr.Project(test_location + 'i386/isalnum', use_sim_procedures=False)
-    state = p.factory.full_init_state(args=['./isalnum'])
+    state = p.factory.full_init_state(args=['./isalnum'], add_options={simuvex.o.STRICT_PAGE_ACCESS})
     pg = p.factory.path_group(state)
     pg2 = pg.step(until=lambda lpg: len(lpg.active) != 1,
                   step_func=lambda lpg: lpg if len(lpg.active) == 1 else lpg.prune()

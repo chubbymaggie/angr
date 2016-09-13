@@ -1,10 +1,12 @@
+import gc
+import os
 import nose
+import pickle
+import logging
+
 import angr
 
-import logging
 l = logging.getLogger("angr.tests")
-
-import os
 test_location = str(os.path.join(os.path.dirname(os.path.realpath(__file__)), '../../binaries/tests'))
 
 target_addrs = {
@@ -54,6 +56,23 @@ def run_fauxware(arch):
     #p.factory.block(divergent_point.addr).pp()
     assert divergent_point.addr == divergences[arch]
 
+def run_pickling(arch):
+    p = angr.Project(os.path.join(test_location, arch, "fauxware"))
+    pg = p.factory.path_group().step(n=10)
+    pickled = pickle.dumps(pg, pickle.HIGHEST_PROTOCOL)
+    del p
+    del pg
+    gc.collect()
+    pg = pickle.loads(pickled)
+
+    pg.explore(find=target_addrs[arch], avoid=avoid_addrs[arch])
+    stdin = pg.found[0].state.posix.dumps(0)
+    nose.tools.assert_equal('\x00\x00\x00\x00\x00\x00\x00\x00\x00SOSNEAKY\x00', stdin)
+
+def run_fastmem(arch):
+    p = angr.Project(os.path.join(test_location, arch, "fauxware"))
+    p.analyses.CongruencyCheck(throw=True).set_state_options(right_add_options={"FAST_REGISTERS"}).run()
+
 def run_nodecode(arch):
     p = angr.Project(os.path.join(test_location, arch, "fauxware"))
 
@@ -71,9 +90,38 @@ def run_nodecode(arch):
     stdin = results.found[0].state.posix.dumps(0)
     nose.tools.assert_equal('\x00\x00\x00\x00\x00\x00\x00\x00\x00SOSNEAKY\x00', stdin)
 
+def run_merge(arch):
+    p = angr.Project(os.path.join(test_location, arch, "fauxware"))
+    pg = p.factory.path_group()
+    pg.explore()
+    pg.merge(stash='deadended')
+
+    path = pg.deadended[[ 'Welcome' in s for s in pg.mp_deadended.state.posix.dumps(1).mp_items ].index(True)]
+    yes, no = sorted(path.history.merge_conditions, key=lambda c: c.depth)
+    inp = path.state.posix.files[0].content.load(0, 18)
+    assert 'SOSNEAKY' in path.state.se.any_str(inp, extra_constraints=(yes,))
+    assert 'SOSNEAKY' not in path.state.se.any_str(inp, extra_constraints=(no,))
+
+def test_merge():
+    for arch in target_addrs:
+        yield run_merge, arch
+
 def test_fauxware():
     for arch in target_addrs:
         yield run_fauxware, arch
+
+def test_pickling():
+    for arch in corrupt_addrs:
+        yield run_pickling, arch
+
+def test_fastmem():
+    #for arch in target_addrs:
+    #   yield run_fastmem, arch
+    # TODO: add support for comparing flags of other architectures
+    #yield run_fastmem, "i386"
+    yield run_fastmem, "x86_64"
+    #yield run_fastmem, "ppc"
+    #yield run_fastmem, "mips"
 
 def test_nodecode():
     for arch in corrupt_addrs:
@@ -82,5 +130,5 @@ def test_nodecode():
 if __name__ == "__main__":
     #for r,a in test_fauxware():
     #   r(a)
-    for r,a in test_nodecode():
+    for r,a in test_pickling():
         r(a)

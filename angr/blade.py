@@ -3,6 +3,8 @@ import networkx
 import pyvex
 import simuvex
 
+from .knowledge import CodeNode
+
 class Blade(object):
     """
     Blade is a light-weight program slicer that works with networkx DiGraph containing SimIRSBs.
@@ -20,7 +22,8 @@ class Blade(object):
         :param angr.analyses.CFGBase cfg: the CFG instance. It will be made mandatory later.
         :param bool ignore_sp:          Whether the stack pointer should be ignored in dependency tracking. Any
                                         dependency from/to stack pointers will be ignored if this options is True.
-        :param ignore_bp:               Whether the base pointer should be ignored or not.
+        :param bool ignore_bp:          Whether the base pointer should be ignored or not.
+        :param int  max_level:          The maximum number of blocks that we trace back for.
         :return: None
         """
 
@@ -40,7 +43,7 @@ class Blade(object):
             raise AngrBladeError('"cfg" must be specified.')
 
         if not self._in_graph(self._dst_run):
-            raise AngrBladeError("The specified SimRun %s doesn't exist in graph.")
+            raise AngrBladeError("The specified SimRun %s doesn't exist in graph." % self._dst_run)
 
         self._ignored_regs = set()
         if ignored_regs:
@@ -161,7 +164,7 @@ class Blade(object):
         elif type(v) in (int, long):
             return v
         else:
-            raise AngrBladeError('Unsupported SimRun argument type %s', type(v))
+            raise AngrBladeError('Unsupported SimRun argument type %s' % type(v))
 
     def _in_graph(self, v):
         return self._get_cfgnode(v) in self._graph
@@ -255,7 +258,7 @@ class Blade(object):
             for pred, _, data in in_edges:
                 if pred not in self._traced_runs:
                     self._traced_runs.add(pred)
-                    self._backward_slice_recursive(self._max_level - 1, pred, regs, stack_offsets, prev, data['stmt_idx'])
+                    self._backward_slice_recursive(self._max_level - 1, pred, regs, stack_offsets, prev, data.get('stmt_idx', None))
 
     def _backward_slice_recursive(self, level, run, regs, stack_offsets, prev, exit_stmt_idx):
 
@@ -310,7 +313,7 @@ class Blade(object):
             for pred, _, data in in_edges:
                 if pred not in self._traced_runs:
                     self._traced_runs.add(pred)
-                    self._backward_slice_recursive(level - 1, pred, regs, stack_offsets, prev, data['stmt_idx'])
+                    self._backward_slice_recursive(level - 1, pred, regs, stack_offsets, prev, data.get('stmt_idx', None))
 
 from .errors import AngrBladeError, AngrBladeSimProcError
 from .analyses.cfg_node import CFGNode

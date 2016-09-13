@@ -28,7 +28,7 @@ def deprecated(f):
 
 class Project(object):
     """
-    This is the main class of the Angr module. It is meant to contain a set of binaries and the relationships between
+    This is the main class of the angr module. It is meant to contain a set of binaries and the relationships between
     them, and perform analyses on them.
 
     :ivar analyses: The available analyses.
@@ -71,7 +71,7 @@ class Project(object):
         :param load_options:                a dict of keyword arguments to the CLE loader. See CLE's docs.
         :param translation_cache:           If True, cache translated basic blocks rather than re-translating them.
         :param support_selfmodifying_code:  Whether we support self-modifying code. When enabled, Project.sim_block()
-                                            will try to read code from the given state, not only from the initial memory
+                                            will try to read code from the current state instead of the original memory
                                             regions.
         :type  support_selfmodifying_code:  bool
 
@@ -133,8 +133,10 @@ class Project(object):
         self._support_selfmodifying_code = support_selfmodifying_code
         self._ignore_functions = ignore_functions
         self._extern_obj = AngrExternObject(self.arch)
+        self._extern_obj.provides = 'angr externs'
         self.loader.add_object(self._extern_obj)
         self._syscall_obj = AngrExternObject(self.arch)
+        self._syscall_obj.provides = 'angr syscalls'
         self.loader.add_object(self._syscall_obj)
 
         self._cfg = None
@@ -270,6 +272,7 @@ class Project(object):
                             :class:`SimProcedure`'s run function.
         """
 
+        l.debug('hooking %#x with %s', addr, func)
         if kwargs is None: kwargs = {}
 
         if self.is_hooked(addr):
@@ -299,6 +302,40 @@ class Project(object):
         :returns:    True if addr is hooked, False otherwise.
         """
         return addr in self._sim_procedures
+
+    def is_symbol_hooked(self, symbol_name):
+        """
+        Check if a symbol is already hooked.
+
+        :param str symbol_name: Name of the symbol.
+        :return: True if the symbol can be resolved and is hooked, False otherwise.
+        :rtype: bool
+        """
+
+        ident = self._symbol_name_to_ident(symbol_name)
+
+        # TODO: this method does not follow the SimOS.prepare_function_symbol() path. We should fix it later.
+
+        if not self._extern_obj.contains_identifier(ident):
+            return False
+
+        return True
+
+    def hooked_symbol_addr(self, symbol_name):
+        """
+        Check if a symbol is hooked or not, and if it is hooked, return the address of the symbol.
+
+        :param str symbol_name: Name of the symbol.
+        :return: Address of the symbol if it is hooked, None otherwise.
+        :rtype: int or None
+        """
+
+        if not self.is_symbol_hooked(symbol_name):
+            return None
+
+        ident = self._symbol_name_to_ident(symbol_name)
+
+        return self._extern_obj.get_pseudo_addr_for_symbol(ident)
 
     def unhook(self, addr):
         """
@@ -338,11 +375,12 @@ class Project(object):
         :param obj:         The thing with which to satisfy the dependency. May be a SimProcedure class or a python
                             function (as an appropriate argument to hook()), or a python integer/long.
         :param kwargs:      Any additional keyword arguments will be passed to the SimProcedure's run() method.
+        :returns:           The pseudo address of this new symbol.
+        :rtype:             int
         """
         if kwargs is None: kwargs = {}
-        ident = 'symbol hook: ' + symbol_name
-        if 'resolves' in kwargs:
-            ident += '.' + kwargs['resolves']
+        ident = self._symbol_name_to_ident(symbol_name, kwargs)
+
 
         if not isinstance(obj, (int, long)):
             pseudo_addr = self._simos.prepare_function_symbol(ident)
@@ -353,14 +391,35 @@ class Project(object):
                 self.unhook(pseudo_addr)
 
             self.hook(pseudo_addr, obj, kwargs=kwargs)
-            l.debug("\t -> setting SimProcedure with pseudo_addr 0x%x...", pseudo_addr)
         else:
             # This is pretty intensely sketchy
+            pseudo_addr = obj
             pseudo_vaddr = obj - self._extern_obj.rebase_addr
 
         self.loader.provide_symbol(self._extern_obj, symbol_name, pseudo_vaddr)
 
-        return pseudo_vaddr
+        return pseudo_addr
+
+    #
+    # Private methods related to hooking
+    #
+
+    @staticmethod
+    def _symbol_name_to_ident(symbol_name, kwargs=None):
+        """
+        Convert a symbol name to an identifier that are used by hooking.
+
+        :param str symbol_name: Name of the symbol.
+        :param dict kwargs: Any additional keyword arguments.
+        :return: An identifier.
+        :rtype: str
+        """
+        ident = 'symbol hook: ' + symbol_name
+        if kwargs and 'resolves' in kwargs:
+            ident += '.' + kwargs['resolves']
+
+        return ident
+
     #
     # Pickling
     #

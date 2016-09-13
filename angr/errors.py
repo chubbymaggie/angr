@@ -10,6 +10,9 @@ class AngrMemoryError(AngrError):
 class AngrTranslationError(AngrError):
     pass
 
+class AngrLifterError(AngrError):
+    pass
+
 class AngrExitError(AngrError):
     pass
 
@@ -52,7 +55,17 @@ class AngrCallableError(AngrSurveyorError):
 class AngrCallableMultistateError(AngrCallableError):
     pass
 
-class AngrUnsupportedSyscallError(AngrError):
+class AngrSyscallError(AngrError):
+    pass
+
+class AngrUnsupportedSyscallError(AngrSyscallError):
+    pass
+
+class AngrSimOSError(AngrError):
+    pass
+
+# Congruency check failure
+class AngrIncongruencyError(AngrAnalysisError):
     pass
 
 #
@@ -62,7 +75,10 @@ class AngrUnsupportedSyscallError(AngrError):
 class AngrForwardAnalysisError(AngrError):
     pass
 
-class AngrForwardAnalysisSkipEntry(AngrForwardAnalysisError):
+class AngrSkipEntryNotice(AngrForwardAnalysisError):
+    pass
+
+class AngrJobMergingFailureNotice(AngrForwardAnalysisError):
     pass
 
 #
@@ -92,3 +108,15 @@ class AngrDataGraphError(AngrAnalysisError):
 
 class AngrDDGError(AngrAnalysisError):
     pass
+
+#
+# Exploration techniques
+#
+
+class AngrExplorationTechniqueError(AngrError):
+    def __str__(self):
+        return "<OtiegnqwvkError %s>" % self.message
+
+class AngrExplorerError(AngrExplorationTechniqueError):
+    def __str(self):
+        return "<OtiegnqwvkExplorerError %s>" % self.message

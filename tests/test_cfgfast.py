@@ -42,6 +42,15 @@ def cfg_fast_functions_check(arch, binary_path, func_addrs, func_features):
         if returning is not "undefined":
             nose.tools.assert_is(cfg.kb.functions.function(addr=func_addr).returning, returning)
 
+    # with normalization enabled
+    cfg = proj.analyses.CFGFast(force_segment=True, normalize=True)
+    nose.tools.assert_true(set([k for k in cfg.kb.functions.keys()]).issuperset(func_addrs))
+
+    for func_addr, feature_dict in func_features.iteritems():
+        returning = feature_dict.get("returning", "undefined")
+        if returning is not "undefined":
+            nose.tools.assert_is(cfg.kb.functions.function(addr=func_addr).returning, returning)
+
 def cfg_fast_edges_check(arch, binary_path, edges):
     """
     Generate a fast CFG on the given binary, and test if all edges are found.
@@ -143,10 +152,18 @@ def test_fauxware():
             }
     }
 
+    return_edges = {
+        'x86_64':
+            [
+                (0x4006fb, 0x4007c7)  # return from accepted to main
+            ]
+    }
+
     arches = functions.keys()
 
     for arch in arches:
         yield cfg_fast_functions_check, arch, filename, functions[arch], function_features[arch]
+        yield cfg_fast_edges_check, arch, filename, return_edges[arch]
 
 def test_cfg_loop_unrolling():
     filename = "cfg_loop_unrolling"
@@ -248,6 +265,21 @@ def test_segment_list_5():
     nose.tools.assert_equal(len(seg_list), 1)
     nose.tools.assert_equal(seg_list._list[0].start, 2)
     nose.tools.assert_equal(seg_list._list[0].end, 10)
+
+def test_segment_list_6():
+    seg_list = SegmentList()
+
+    seg_list.occupy(10, 20, "code")
+    seg_list.occupy(9, 2, "data")
+
+    nose.tools.assert_equal(len(seg_list), 2)
+    nose.tools.assert_equal(seg_list._list[0].start, 9)
+    nose.tools.assert_equal(seg_list._list[0].end, 11)
+    nose.tools.assert_equal(seg_list._list[0].sort, 'data')
+
+    nose.tools.assert_equal(seg_list._list[1].start, 11)
+    nose.tools.assert_equal(seg_list._list[1].end, 30)
+    nose.tools.assert_equal(seg_list._list[1].sort, 'code')
 
 def main():
 

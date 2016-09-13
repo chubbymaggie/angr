@@ -36,10 +36,22 @@ class FunctionManager(collections.Mapping):
     def __init__(self, kb):
         self._kb = kb
         self._function_map = FunctionDict(self)
-        self.callgraph = networkx.DiGraph()
+        self.callgraph = networkx.MultiDiGraph()
 
         # Registers used for passing arguments around
         self._arg_registers = kb._project.arch.argument_registers
+
+    def copy(self):
+        fm = FunctionManager(self._kb)
+        fm._function_map = self._function_map.copy()
+        fm.callgraph = networkx.MultiDiGraph(self.callgraph)
+        fm._arg_registers = self._arg_registers.copy()
+
+        return fm
+
+    def clear(self):
+        self._function_map.clear()
+        self.callgraph = networkx.MultiDiGraph()
 
     def _genenare_callmap_sif(self, filepath):
         """
@@ -52,13 +64,13 @@ class FunctionManager(collections.Mapping):
             for src, dst in self.callgraph.edges():
                 f.write("%#x\tDirectEdge\t%#x\n" % (src, dst))
 
-    def _add_node(self, function_addr, node, syscall=None):
+    def _add_node(self, function_addr, node, syscall=None, size=None):
         if type(node) in (int, long):  # pylint: disable=unidiomatic-typecheck
-            node = self._kb._project.factory.snippet(node)
+            node = self._kb._project.factory.snippet(node, max_size=size)
         dst_func = self._function_map[function_addr]
         if syscall in (True, False):
             dst_func.is_syscall = syscall
-        dst_func._register_nodes(node)
+        dst_func._register_nodes(True, node)
 
     def _add_call_to(self, function_addr, from_node, to_addr, retn_node, syscall=None):
 
@@ -72,9 +84,16 @@ class FunctionManager(collections.Mapping):
 
         self._function_map[function_addr]._call_to(from_node, dest_func, retn_node)
         self._function_map[function_addr]._add_call_site(from_node.addr, to_addr, retn_node.addr if retn_node else None)
-        self.callgraph.add_edge(function_addr, to_addr)
 
-    def _add_fakeret_to(self, function_addr, from_node, to_node, confirmed=None, syscall=None):
+        # is there any existing edge on the callgraph?
+        edge_data = {'type': 'call'}
+        if function_addr not in self.callgraph or \
+                to_addr not in self.callgraph[function_addr] or \
+                edge_data not in self.callgraph[function_addr][to_addr].values():
+            self.callgraph.add_edge(function_addr, to_addr, **edge_data)
+
+    def _add_fakeret_to(self, function_addr, from_node, to_node, confirmed=None, syscall=None, to_outside=False,
+                        to_function_addr=None):
         if type(from_node) in (int, long):  # pylint: disable=unidiomatic-typecheck
             from_node = self._kb._project.factory.snippet(from_node)
         if type(to_node) in (int, long):  # pylint: disable=unidiomatic-typecheck
@@ -84,7 +103,15 @@ class FunctionManager(collections.Mapping):
         if syscall in (True, False):
             src_func.is_syscall = syscall
 
-        src_func._fakeret_to(from_node, to_node, confirmed=confirmed)
+        src_func._fakeret_to(from_node, to_node, confirmed=confirmed, to_outside=to_outside)
+
+        if to_outside and to_function_addr is not None:
+            # mark it on the callgraph
+            edge_data = {'type': 'fakeret'}
+            if function_addr not in self.callgraph or \
+                    to_function_addr not in self.callgraph[function_addr] or \
+                    edge_data not in self.callgraph[function_addr][to_function_addr].values():
+                self.callgraph.add_edge(function_addr, to_function_addr, **edge_data)
 
     def _remove_fakeret(self, function_addr, from_node, to_node):
         if type(from_node) in (int, long):  # pylint: disable=unidiomatic-typecheck
@@ -104,6 +131,21 @@ class FunctionManager(collections.Mapping):
         if type(to_node) in (int, long):  # pylint: disable=unidiomatic-typecheck
             to_node = self._kb._project.factory.snippet(to_node)
         self._function_map[function_addr]._transit_to(from_node, to_node)
+
+    def _add_outside_transition_to(self, function_addr, from_node, to_node, to_function_addr=None):
+        if type(from_node) in (int, long):  # pylint: disable=unidiomatic-typecheck
+            from_node = self._kb._project.factory.snippet(from_node)
+        if type(to_node) in (int, long):  # pylint: disable=unidiomatic-typecheck
+            to_node = self._kb._project.factory.snippet(to_node)
+        self._function_map[function_addr]._transit_to(from_node, to_node, outside=True)
+
+        if to_function_addr is not None:
+            # mark it on the callgraph
+            edge_data = {'type': 'transition'}
+            if function_addr not in self.callgraph or \
+                    to_function_addr not in self.callgraph[function_addr] or \
+                    edge_data not in self.callgraph[function_addr][to_function_addr].values():
+                self.callgraph.add_edge(function_addr, to_function_addr, **edge_data)
 
     def _add_return_from_call(self, function_addr, src_function_addr, to_node):
 

@@ -1,6 +1,5 @@
 import sys
 import logging
-import capstone
 from cachetools import LRUCache
 
 import pyvex
@@ -24,11 +23,88 @@ class Lifter(object):
     Usually, the only way you'll ever have to interact with this class is that its `lift` method has
     been transplanted into the factory as `project.factory.block`.
     """
-    def __init__(self, project, cache=False):
+
+    LRUCACHE_SIZE = 10000
+
+    def __init__(self, project=None, arch=None, cache=False):
+        if project:
+            self._arch = project.arch
+        elif arch:
+            self._arch = arch
+        else:
+            self._arch = None
+
         self._project = project
-        self._thumbable = isinstance(project.arch, ArchARM)
+        self._thumbable = isinstance(self._arch, ArchARM) if self._arch is not None else False
         self._cache_enabled = cache
-        self._block_cache = LRUCache(maxsize=10000)
+        self._block_cache = LRUCache(maxsize=self.LRUCACHE_SIZE)
+
+        self._cache_hit_count = 0
+        self._cache_miss_count = 0
+
+    def clear_cache(self):
+        self._block_cache = LRUCache(maxsize=self.LRUCACHE_SIZE)
+
+        self._cache_hit_count = 0
+        self._cache_miss_count = 0
+
+    def _normalize_options(self, addr, arch, thumb):
+        """
+        Given a subset of the arguments to lift or fresh_block, perform all the sanity checks
+        and normalize the form of the args
+        """
+        if arch is None:
+            if self._arch is None:
+                raise AngrLifterError('"arch" must be specified')
+
+            thumbable = self._thumbable
+            arch = self._arch
+        else:
+            thumbable = isinstance(arch, ArchARM)
+
+        if thumbable and addr % 2 == 1:
+            thumb = True
+        elif not thumbable and thumb:
+            l.warning("Why did you pass in thumb=True on a non-ARM architecture")
+            thumb = False
+
+        if thumb:
+            addr &= ~1
+
+        return addr, arch, thumb
+
+    def fresh_block(self, addr, size, arch=None, insn_bytes=None, thumb=False):
+        """
+        Returns a Block object with the specified size. No lifting will be performed.
+
+        :param int addr: Address at which to start the block.
+        :param int size: Size of the block.
+        :return: A Block instance.
+        :rtype: Block
+        """
+        addr, arch, thumb = self._normalize_options(addr, arch, thumb)
+
+        if self._cache_enabled:
+            for opt_level in (0, 1):
+                cache_key = (addr, insn_bytes, size, None, thumb, opt_level)
+                if cache_key in self._block_cache:
+                    return self._block_cache[cache_key]
+
+        if insn_bytes is None:
+            if self._project is None:
+                raise AngrLifterError("Lifter does not have an associated angr Project. "
+                                      "You must specify \"insn_bytes\".")
+            insn_bytes, size = self._load_bytes(addr, size, None)
+
+        if thumb:
+            addr += 1
+
+        b = Block(insn_bytes, arch=arch, addr=addr, size=size, thumb=thumb)
+
+        if self._cache_enabled:
+            self._block_cache[cache_key] = b
+
+        return b
 
     def lift(self, addr, arch=None, insn_bytes=None, max_size=None, num_inst=None,
              traceflags=0, thumb=False, backup_state=None, opt_level=None):
@@ -54,40 +130,26 @@ class Lifter(object):
         num_inst = VEX_IRSB_MAX_INST if num_inst is None else num_inst
         opt_level = VEX_DEFAULT_OPT_LEVEL if opt_level is None else opt_level
 
-        if self._thumbable and addr % 2 == 1:
-            thumb = True
-        elif not self._thumbable and thumb:
-            l.warning("Why did you pass in thumb=True on a non-ARM architecture")
-            thumb = False
-
-        if thumb:
-            addr &= ~1
+        addr, arch, thumb = self._normalize_options(addr, arch, thumb)
 
         cache_key = (addr, insn_bytes, max_size, num_inst, thumb, opt_level)
-        if self._cache_enabled and cache_key in self._block_cache:
+        if self._cache_enabled and cache_key in self._block_cache and self._block_cache[cache_key].vex is not None:
+            self._cache_hit_count += 1
             return self._block_cache[cache_key]
-
-        # TODO: FIXME: figure out what to do if we're about to exhaust the memory
-        # (we can probably figure out how many instructions we have left by talking to IDA)
+        else:
+            self._cache_miss_count += 1
 
         if insn_bytes is not None:
             buff, size = insn_bytes, len(insn_bytes)
-            max_size = min(max_size, size)
             passed_max_size = True
         else:
-            buff, size = "", 0
+            if self._project is None:
+                raise AngrLifterError("Lifter does not have an associated angr Project. "
+                                      "You must specify \"insn_bytes\".")
+            buff, size = self._load_bytes(addr, max_size, state=backup_state)
 
-            if backup_state:
-                buff, size = self._bytes_from_state(backup_state, addr, max_size)
-                max_size = min(max_size, size)
-            else:
-                try:
-                    buff, size = self._project.loader.memory.read_bytes_c(addr)
-                except KeyError:
-                    pass
-
-            if not buff or size == 0:
-                raise AngrMemoryError("No bytes in memory for block starting at 0x%x." % addr)
+        if not buff or size == 0:
+            raise AngrMemoryError("No bytes in memory for block starting at %#x." % addr)
 
         # deal with thumb mode in ARM, sending an odd address and an offset
         # into the string
@@ -97,15 +159,13 @@ class Lifter(object):
             byte_offset = 1
             addr += 1
 
-        l.debug("Creating pyvex.IRSB of arch %s at 0x%x", self._project.arch.name, addr)
-
-        arch = arch or self._project.arch
+        l.debug("Creating pyvex.IRSB of arch %s at %#x", arch.name, addr)
 
         pyvex.set_iropt_level(opt_level)
         try:
             if passed_max_size and not passed_num_inst:
                 irsb = pyvex.IRSB(buff, addr, arch,
-                                  num_bytes=max_size,
+                                  num_bytes=size,
                                   bytes_offset=byte_offset,
                                   traceflags=traceflags)
             elif not passed_max_size and passed_num_inst:
@@ -116,13 +176,13 @@ class Lifter(object):
                                   traceflags=traceflags)
             elif passed_max_size and passed_num_inst:
                 irsb = pyvex.IRSB(buff, addr, arch,
-                                  num_bytes=min(size, max_size),
+                                  num_bytes=size,
                                   num_inst=num_inst,
                                   bytes_offset=byte_offset,
                                   traceflags=traceflags)
             else:
                 irsb = pyvex.IRSB(buff, addr, arch,
-                                  num_bytes=min(size, max_size),
+                                  num_bytes=size,
                                   bytes_offset=byte_offset,
                                   traceflags=traceflags)
         except pyvex.PyVEXError:
@@ -134,7 +194,7 @@ class Lifter(object):
             e_type, value, traceback = sys.exc_info()
             raise AngrTranslationError, ("Translation error", e_type, value), traceback
 
-        if insn_bytes is None:
+        if insn_bytes is None and self._project is not None:
             for stmt in irsb.statements:
                 if stmt.tag != 'Ist_IMark' or stmt.addr == real_addr:
                     continue
@@ -146,11 +206,25 @@ class Lifter(object):
                                       traceflags=traceflags)
                     break
 
-        irsb = self._post_process(irsb)
-        b = Block(buff, irsb, thumb)
+        irsb = self._post_process(irsb, arch)
+        b = Block(buff, arch=arch, addr=addr, vex=irsb, thumb=thumb)
         if self._cache_enabled:
             self._block_cache[cache_key] = b
         return b
+
+    def _load_bytes(self, addr, max_size, state=None):
+        buff, size = "", 0
+        if self._project._support_selfmodifying_code and state:
+            buff, size = self._bytes_from_state(state, addr, max_size)
+        else:
+            try:
+                buff, size = self._project.loader.memory.read_bytes_c(addr)
+            except KeyError:
+                if state:
+                    buff, size = self._bytes_from_state(state, addr, max_size)
+
+        size = min(max_size, size)
+        return buff, size
 
     @staticmethod
     def _bytes_from_state(backup_state, addr, max_size):
@@ -158,7 +232,7 @@ class Lifter(object):
 
         for i in range(addr, addr + max_size):
             if i in backup_state.memory:
-                val = backup_state.memory.load(i, 1)
+                val = backup_state.memory.load(i, 1, inspect=False)
                 try:
                     val = backup_state.se.exactly_n_int(val, 1)[0]
                     val = chr(val)
@@ -174,7 +248,7 @@ class Lifter(object):
 
         return buff, size
 
-    def _post_process(self, block):
+    def _post_process(self, block, arch):
         """
         Do some post-processing work here.
 
@@ -184,13 +258,14 @@ class Lifter(object):
 
         block.statements = [x for x in block.statements if x.tag != 'Ist_NoOp']
 
-        funcname = "_post_process_%s" % self._project.arch.name
+        funcname = "_post_process_%s" % arch.name
         if hasattr(self, funcname):
-            block = getattr(self, funcname)(block)
+            block = getattr(self, funcname)(block, arch)
 
         return block
 
-    def _post_process_ARM(self, block):
+    @staticmethod
+    def _post_process_ARM(block, arch):
 
         # Jumpkind
         if block.jumpkind == "Ijk_Boring":
@@ -206,7 +281,7 @@ class Lifter(object):
             inst_ctr = 1
             for i, stmt in reversed(list(enumerate(stmts))):
                 if isinstance(stmt, pyvex.IRStmt.Put):
-                    if stmt.offset == self._project.arch.registers['lr'][0]:
+                    if stmt.offset == arch.registers['lr'][0]:
                         lr_store_id = i
                         break
                 if isinstance(stmt, pyvex.IRStmt.IMark):
@@ -221,7 +296,7 @@ class Lifter(object):
     _post_process_ARMHF = _post_process_ARM
 
     @staticmethod
-    def _post_process_MIPS32(block):
+    def _post_process_MIPS32(block, arch):  #pylint:disable=unused-argument
 
         # Handle unconditional branches
         # `beq $zero, $zero, xxxx`
@@ -313,37 +388,67 @@ class Lifter(object):
 
 
 class Block(object):
-    def __init__(self, byte_string, vex, thumb):
-        self._bytes = byte_string
-        self.vex = vex
+    BLOCK_MAX_SIZE = 4096
+
+    __slots__ = ['bytes', '_vex', '_thumb', '_arch', '_capstone', 'addr', 'size', 'instructions', 'instruction_addrs']
+
+    def __init__(self, byte_string, arch, addr=None, size=None, vex=None, thumb=None):
+        self._vex = vex
         self._thumb = thumb
-        self._arch = vex.arch
+        self._arch = arch
         self._capstone = None
-        self.addr = None
-        self.size = vex.size
-        self.instructions = vex.instructions
+        self.addr = addr
+        self.size = size
+
+        self.instructions = None
         self.instruction_addrs = []
 
-        for stmt in vex.statements:
-            if stmt.tag != 'Ist_IMark':
-                continue
-            if self.addr is None:
-                self.addr = stmt.addr + stmt.delta
-            self.instruction_addrs.append(stmt.addr + stmt.delta)
+        self._parse_vex_info()
 
         if self.addr is None:
             l.warning('Lifted basic block with no IMarks!')
             self.addr = 0
 
+        if type(byte_string) is str:
+            if self.size is not None:
+                self.bytes = byte_string[:self.size]
+            else:
+                self.bytes = byte_string
+        else:
+            # Convert bytestring to a str
+            if self.size is not None:
+                self.bytes = str(pyvex.ffi.buffer(byte_string, self.size))
+            else:
+                l.warning("Block size is unknown. Truncate it to BLOCK_MAX_SIZE")
+                self.bytes = str(pyvex.ffi.buffer(byte_string), Block.BLOCK_MAX_SIZE)
+
+    def _parse_vex_info(self):
+        vex = self._vex
+        if vex is not None:
+            self.instructions = vex.instructions
+
+            if self._arch is None:
+                self._arch = vex.arch
+
+            if self.size is None:
+                self.size = vex.size
+
+            for stmt in vex.statements:
+                if stmt.tag != 'Ist_IMark':
+                    continue
+                if self.addr is None:
+                    self.addr = stmt.addr + stmt.delta
+                self.instruction_addrs.append(stmt.addr + stmt.delta)
+
     def __repr__(self):
         return '<Block for %#x, %d bytes>' % (self.addr, self.size)
 
     def __getstate__(self):
-        self._bytes = self.bytes
-        return self.__dict__
+        return dict((k, getattr(self, k)) for k in self.__slots__ if k not in ('_capstone', ))
 
     def __setstate__(self, data):
-        self.__dict__.update(data)
+        for k, v in data.iteritems():
+            setattr(self, k, v)
 
     def __hash__(self):
         return hash((type(self), self.addr, self.bytes))
@@ -360,11 +465,13 @@ class Block(object):
         return self.capstone.pp()
 
     @property
-    def bytes(self):
-        bytestring = self._bytes
-        if not isinstance(bytestring, str):
-            bytestring = str(pyvex.ffi.buffer(bytestring, self.size))
-        return bytestring
+    def vex(self):
+        if not self._vex:
+            offset = 1 if self._thumb else 0
+            self._vex = pyvex.IRSB(self.bytes, self.addr, self._arch, bytes_offset=offset)
+            self._parse_vex_info()
+
+        return self._vex
 
     @property
     def capstone(self):
@@ -386,51 +493,9 @@ class Block(object):
         return BlockNode(self.addr, self.size, bytestr=self.bytes)
 
 
-class CopyClass(object):
-    def __init__(self, obj):
-        for attr in dir(obj):
-            if attr.startswith('_'):
-                continue
-            val = getattr(obj, attr)
-            if type(val) in (int, long, list, tuple, str, dict, float):  # pylint: disable=unidiomatic-typecheck
-                setattr(self, attr, val)
-            else:
-                setattr(self, attr, CopyClass(val))
-
-
-class CapstoneInsn(object):
-    def __init__(self, insn):
-        self._cs = insn._cs
-        self.address = insn.address
-        self.bytes = insn.bytes
-        if hasattr(insn, 'cc'):
-            self.cc = insn.cc
-        self.groups = insn.groups
-        self.id = insn.id
-        self._insn_name = insn.insn_name()
-        self.mnemonic = insn.mnemonic
-        self.op_str = insn.op_str
-        self.operands = map(CopyClass, insn.operands)
-        self.size = insn.size
-
-    def group(self, grpnum):
-        return grpnum in self.groups
-
-    def insn_name(self):
-        return self._insn_name
-
-    def reg_name(self, reg_id):
-        # I don't like this API, but it's replicating Capstone's...
-        return capstone._cs.cs_reg_name(self._cs.csh, reg_id).decode('ascii')
-
-    def __str__(self):
-        return "0x%x:\t%s\t%s" % (self.address, self.mnemonic, self.op_str)
-
-    def __repr__(self):
-        return '<CapstoneInsn "%s" for %#x>' % (self.mnemonic, self.address)
-
-
 class CapstoneBlock(object):
+    __slots__ = [ 'addr', 'insns', 'thumb', 'arch' ]
+
     def __init__(self, addr, insns, thumb, arch):
         self.addr = addr
         self.insns = insns
@@ -447,5 +512,23 @@ class CapstoneBlock(object):
         return '<CapstoneBlock for %#x>' % self.addr
 
 
-from .errors import AngrMemoryError, AngrTranslationError
+class CapstoneInsn(object):
+    def __init__(self, capstone_insn):
+        self.insn = capstone_insn
+
+    def __getattr__(self, item):
+        if item in ('__str__', '__repr__'):
+            return self.__getattribute__(item)
+        if hasattr(self.insn, item):
+            return getattr(self.insn, item)
+        raise AttributeError()
+
+    def __str__(self):
+        return "%#x:\t%s\t%s" % (self.address, self.mnemonic, self.op_str)
+
+    def __repr__(self):
+        return '<CapstoneInsn "%s" for %#x>' % (self.mnemonic, self.address)
+
+
+from .errors import AngrMemoryError, AngrTranslationError, AngrLifterError
 from .knowledge.codenode import BlockNode
