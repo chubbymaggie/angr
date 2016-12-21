@@ -24,6 +24,7 @@ class Function(object):
         """
         self.transition_graph = networkx.DiGraph()
         self._local_transition_graph = None
+        self.normalized = False
 
         # block nodes at whose ends the function returns
         self._ret_sites = set()
@@ -45,27 +46,40 @@ class Function(object):
         self.is_plt = False
         self.is_simprocedure = False
 
-        if name is None:
-            # Try to get a name from project.loader
-            name = project.loader.find_symbol_name(addr)
-        if name is None:
-            name = project.loader.find_plt_stub_name(addr)
-            if name is not None:
-                name = 'plt.' + name
-                # Whether this function is a plt entry or not is fully relying on the PLT detection in CLE
-                self.is_plt = True
         if project.is_hooked(addr):
-            hooker = project.hooked_by(addr)
             self.is_simprocedure = True
-            if hooker is simuvex.SimProcedures['stubs']['ReturnUnconstrained']:
-                kwargs_dict = project._sim_procedures[addr][1]
-                if 'resolves' in kwargs_dict:
-                    name = kwargs_dict['resolves']
-            else:
-                name = hooker.__name__.split('.')[-1]
+
+        if project.loader.find_plt_stub_name(addr) is not None:
+            # Whether this function is a plt entry or not is fully relying on the PLT detection in CLE
+            self.is_plt = True
+
+        # Try to get a name from existing labels
+        if name is None and addr in function_manager._kb.labels:
+            name = function_manager._kb.labels[addr]
+
+        # try to get the name from a hook
+        if name is None:
+            if project.is_hooked(addr):
+                hooker = project.hooked_by(addr)
+                if hooker is simuvex.SimProcedures['stubs']['ReturnUnconstrained']:
+                    kwargs_dict = project._sim_procedures[addr][1]
+                    if 'resolves' in kwargs_dict:
+                        name = kwargs_dict['resolves']
+                else:
+                    name = hooker.__name__.split('.')[-1]
+
+        # try to get the name from the symbols
+        #if name is None:
+        #   so = project.loader.addr_belongs_to_object(addr)
+        #   if so is not None and addr in so.symbols_by_addr:
+        #       name = so.symbols_by_addr[addr].name
+        #       print name
+
+        # generate an IDA-style sub_X name
         if name is None:
             name = 'sub_%x' % addr
 
+        self._name = None
         self.name = name
 
         # Register offsets of those arguments passed in registers
@@ -80,7 +94,7 @@ class Function(object):
         self.sp_delta = 0
 
         # Calling convention
-        self.call_convention = None
+        self.calling_convention = None
 
         # Whether this function returns or not. `None` means it's not determined yet
         self.returning = None
@@ -99,6 +113,15 @@ class Function(object):
         self._local_block_addrs = set() # a set of addresses of all blocks inside the function
 
         self.info = { }  # storing special information, like $gp values for MIPS32
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, v):
+        self._name = v
+        self._function_manager._kb.labels[self.addr] = v
 
     @property
     def blocks(self):
@@ -186,13 +209,14 @@ class Function(object):
         All of the constants that are used by this functions's code.
         """
         # TODO: remove link register values
-        return [const for block in self.blocks for const in block.vex.constants]
+        return [const.value for block in self.blocks for const in block.vex.constants]
 
-    def string_references(self, minimum_length=2):
+    def string_references(self, minimum_length=2, vex_only=False):
         """
         All of the constant string references used by this function.
 
         :param minimum_length:  The minimum length of strings to find (default is 1)
+        :param vex_only:        Only analyze VEX IR, don't interpret the entry state to detect additional constants.
         :return:                A list of tuples of (address, string) where is address is the location of the string in
                                 memory.
         """
@@ -208,7 +232,7 @@ class Function(object):
             known_executable_addresses.update(set(x.addr for x in function.graph.nodes()))
 
         # loop over all local runtime values and check if the value points to a printable string
-        for addr in self.local_runtime_values:
+        for addr in self.local_runtime_values if not vex_only else self.code_constants:
             if not isinstance(addr, claripy.fp.FPV) and addr in memory:
                 # check that the address isn't an pointing to known executable code
                 # and that it isn't an indirect pointer to known executable code
@@ -280,20 +304,21 @@ class Function(object):
             # get runtime values from logs of successors
             p = self._project.factory.path(state)
             p.step()
-            for succ in p.next_run.flat_successors + p.next_run.unsat_successors:
-                for a in succ.log.actions:
-                    for ao in a.all_objects:
-                        if not isinstance(ao.ast, claripy.ast.Base):
-                            constants.add(ao.ast)
-                        elif not ao.ast.symbolic:
-                            constants.add(succ.se.any_int(ao.ast))
+            if p.next_run is not None:
+                for succ in p.next_run.flat_successors + p.next_run.unsat_successors:
+                    for a in succ.log.actions:
+                        for ao in a.all_objects:
+                            if not isinstance(ao.ast, claripy.ast.Base):
+                                constants.add(ao.ast)
+                            elif not ao.ast.symbolic:
+                                constants.add(succ.se.any_int(ao.ast))
 
-                # add successors to the queue to analyze
-                if not succ.se.symbolic(succ.ip):
-                    succ_ip = succ.se.any_int(succ.ip)
-                    if succ_ip in self and succ_ip not in analyzed:
-                        analyzed.add(succ_ip)
-                        q.insert(0, succ)
+                    # add successors to the queue to analyze
+                    if not succ.se.symbolic(succ.ip):
+                        succ_ip = succ.se.any_int(succ.ip)
+                        if succ_ip in self and succ_ip not in analyzed:
+                            analyzed.add(succ_ip)
+                            q.insert(0, succ)
 
             # force jumps to missing successors
             # (this is a slightly hacky way to force it to explore all the nodes in the function)
@@ -304,7 +329,7 @@ class Function(object):
             missing = set(x.addr for x in self.graph.successors(node)) - analyzed
             for succ_addr in missing:
                 l.info("Forcing jump to missing successor: %#x", succ_addr)
-                if succ_addr not in analyzed:
+                if succ_addr not in analyzed and p.next_run is not None:
                     all_successors = p.next_run.unconstrained_successors + p.next_run.flat_successors + \
                                      p.next_run.unsat_successors
                     if len(all_successors) > 0:
@@ -356,7 +381,7 @@ class Function(object):
             (self._argument_registers,
              self._argument_stack_variables)
         s += '  Blocks: [%s]\n' % ", ".join(['%#x' % i.addr for i in self._local_blocks])
-        s += "  Calling convention: %s" % self.call_convention
+        s += "  Calling convention: %s" % self.calling_convention
         return s
 
     def __repr__(self):
@@ -403,7 +428,7 @@ class Function(object):
 
         self.transition_graph[src][dst]['confirmed'] = True
 
-    def _transit_to(self, from_node, to_node, outside=False):
+    def _transit_to(self, from_node, to_node, outside=False, ins_addr=None, stmt_idx=None):
         """
         Registers an edge between basic blocks in this function's transition graph.
         Arguments are CodeNode objects.
@@ -424,7 +449,9 @@ class Function(object):
         else:
             self._register_nodes(True, from_node, to_node)
 
-        self.transition_graph.add_edge(from_node, to_node, type='transition', outside=outside)
+        self.transition_graph.add_edge(from_node, to_node, type='transition', outside=outside, ins_addr=ins_addr,
+                                       stmt_idx=stmt_idx
+                                       )
 
         if outside:
             # this node is an endpoint of the current function
@@ -433,7 +460,7 @@ class Function(object):
         # clear the cache
         self._local_transition_graph = None
 
-    def _call_to(self, from_node, to_func, ret_node):
+    def _call_to(self, from_node, to_func, ret_node, stmt_idx=None, ins_addr=None):
         """
         Registers an edge between the caller basic block and callee function.
 
@@ -444,14 +471,18 @@ class Function(object):
         :param ret_node     The basic block that control flow should return to after the
                             function call.
         :type  to_func:     angr.knowledge.CodeNode or None
+        :param stmt_idx:    Statement ID of this call.
+        :type  stmt_idx:    int, str or None
+        :param ins_addr:    Instruction address of this call.
+        :type  ins_addr:    int or None
         """
 
         self._register_nodes(True, from_node)
 
         if to_func.is_syscall:
-            self.transition_graph.add_edge(from_node, to_func, type='syscall')
+            self.transition_graph.add_edge(from_node, to_func, type='syscall', stmt_idx=stmt_idx, ins_addr=ins_addr)
         else:
-            self.transition_graph.add_edge(from_node, to_func, type='call')
+            self.transition_graph.add_edge(from_node, to_func, type='call', stmt_idx=stmt_idx, ins_addr=ins_addr)
             if ret_node is not None:
                 self._fakeret_to(from_node, ret_node)
 
@@ -489,6 +520,7 @@ class Function(object):
             raise AngrValueError('_register_nodes(): the "is_local" parameter must be a bool')
 
         for node in nodes:
+            node.function = self
             self.transition_graph.add_node(node)
             node._graph = self.transition_graph
             if node.addr not in self or self._block_sizes[node.addr] == 0:
@@ -716,10 +748,10 @@ class Function(object):
 
     @property
     def arguments(self):
-        if self.call_convention is None:
+        if self.calling_convention is None:
             return self._argument_registers + self._argument_stack_variables
         else:
-            return self.call_convention.args
+            return self.calling_convention.args
 
     @property
     def has_return(self):
@@ -742,7 +774,7 @@ class Function(object):
         # let's put a check here
         if self.startpoint is None:
             # this function is empty
-            l.error('Unexpected error: %s does not have any blocks. normalize() fails.', repr(self))
+            l.debug('Unexpected error: %s does not have any blocks. normalize() fails.', repr(self))
             return
 
         graph = self.transition_graph
@@ -762,7 +794,7 @@ class Function(object):
             other_nodes = all_nodes[1:]
 
             is_outside_node = False
-            if smallest_node not in self.graph:
+            if smallest_node not in graph:
                 is_outside_node = True
 
             # Break other nodes
@@ -833,6 +865,8 @@ class Function(object):
 
         # Clear the cache
         self._local_transition_graph = None
+
+        self.normalized = True
 
     def _match_cc(self):
         """

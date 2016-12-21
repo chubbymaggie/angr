@@ -496,6 +496,7 @@ class SimLinux(SimOS):
             14: ('sigprocmask', 'sigprocmask'),
             39: ('getpid', 'getpid'),
             60: ('exit', 'exit'),
+            158: ('arch_prctl','arch_prctl'),
             186: ('gettid', 'gettid'),
             231: ('exit_group', 'exit'),  # really exit_group, but close enough
             234: ('tgkill', 'tgkill'),
@@ -510,16 +511,31 @@ class SimLinux(SimOS):
             252: ('exit_group', 'exit'),  # really exit_group, but close enough
         },
         'PPC32': {
-
+            1: ('exit', 'exit'),
+            3: ('read', 'read'),
+            4: ('write', 'write'),
+            5: ('open', 'open'),
+            6: ('close', 'close'),
+            45: ('brk', 'brk'),
         },
         'PPC64': {
 
         },
         'MIPS32': {
-
+            4001: ('exit', 'exit'),
+            4003: ('read', 'read'),
+            4004: ('write', 'write'),
+            4005: ('open', 'open'),
+            4006: ('close', 'close'),
+            4045: ('brk', 'brk'),
         },
         'MIPS64': {
-
+            5000: ('read', 'read'),
+            5001: ('write', 'write'),
+            5002: ('open', 'open'),
+            5003: ('close', 'close'),
+            5012: ('brk', 'brk'),
+            5058: ('exit', 'exit'),
         },
         'ARM': {
 
@@ -597,7 +613,10 @@ class SimLinux(SimOS):
                     for reloc in binary.relocs:
                         if reloc.symbol is None or reloc.resolvedby is None:
                             continue
-                        if reloc.resolvedby.type != 'STT_GNU_IFUNC':
+                        try:
+                            if reloc.resolvedby.elftype != 'STT_GNU_IFUNC':
+                                continue
+                        except AttributeError:
                             continue
                         gotaddr = reloc.addr + binary.rebase_addr
                         gotvalue = self.proj.loader.memory.read_addr_at(gotaddr)
@@ -610,7 +629,7 @@ class SimLinux(SimOS):
                                 'gotaddr': gotaddr,
                                 'funcname': reloc.symbol.name
                         }
-                        randaddr = self.proj._extern_obj.get_pseudo_addr('ifunc_' + reloc.symbol.name)
+                        randaddr = self.proj._extern_obj.get_pseudo_addr('ifunc_%s_%s' % (binary.binary, reloc.symbol.name))
                         self.proj.hook(randaddr, IFuncResolver, kwargs=kwargs)
                         self.proj.loader.memory.write_addr_at(gotaddr, randaddr)
 
@@ -633,7 +652,10 @@ class SimLinux(SimOS):
             elif isinstance(state.arch, ArchAArch64):
                 state.regs.tpidr_el0 = self.proj.loader.tls_object.user_thread_pointer
 
-        state.register_plugin('posix', SimStateSystem(fs=fs, concrete_fs=concrete_fs, chroot=chroot))
+        last_addr = self.proj.loader.main_bin.get_max_addr()
+        brk = last_addr - last_addr % 0x1000 + 0x1000
+
+        state.register_plugin('posix', SimStateSystem(fs=fs, concrete_fs=concrete_fs, chroot=chroot, brk=brk))
 
         if self.proj.loader.main_bin.is_ppc64_abiv1:
             state.libc.ppc64_abiv = 'ppc64_1'

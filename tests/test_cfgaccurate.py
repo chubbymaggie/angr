@@ -247,7 +247,7 @@ def test_fakeret_edges_0():
     p = angr.Project(binary_path)
     cfg = p.analyses.CFGAccurate(context_sensitivity_level=3)
 
-    putchar = cfg.functions.function(name="putchar")
+    putchar = cfg.functions.function(name="putchar", plt=False)
 
     # Since context sensitivity is 3, there should be two different putchar nodes
     putchar_cfgnodes = cfg.get_all_nodes(putchar.addr)
@@ -307,6 +307,24 @@ def test_arrays():
 
     successors = cfg.get_successors(node)
     nose.tools.assert_equal(len(successors), 2)
+
+def test_max_steps():
+
+    binary_path = os.path.join(test_location, "x86_64", "fauxware")
+    b = angr.Project(binary_path, load_options={'auto_load_libs': False})
+    cfg = b.analyses.CFGAccurate(max_steps=5)
+
+    dfs_edges = networkx.dfs_edges(cfg.graph)
+
+    depth_map = {}
+    for src, dst in dfs_edges:
+        if src not in depth_map:
+            depth_map[src] = 0
+        if dst not in depth_map:
+            depth_map[dst] = depth_map[src] + 1
+        depth_map[dst] = max(depth_map[src] + 1, depth_map[dst])
+
+    nose.tools.assert_less_equal(max(depth_map.itervalues()), 5)
 
 def run_all():
     functions = globals()

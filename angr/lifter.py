@@ -128,6 +128,12 @@ class Lifter(object):
         passed_num_inst = num_inst is not None
         max_size = VEX_IRSB_MAX_SIZE if max_size is None else max_size
         num_inst = VEX_IRSB_MAX_INST if num_inst is None else num_inst
+
+        if self._project._support_selfmodifying_code:
+            if opt_level > 0:
+                l.warning("Self-modifying code is not always correctly optimized by PyVEX. To guarantee correctness, VEX optimizations have been disabled.")
+            opt_level = 0
+
         opt_level = VEX_DEFAULT_OPT_LEVEL if opt_level is None else opt_level
 
         addr, arch, thumb = self._normalize_options(addr, arch, thumb)
@@ -337,9 +343,8 @@ class Lifter(object):
                                 1].con.value:
 
                         # Create a new IRConst
-                        irconst = pyvex.IRExpr.Const.__new__()  # XXX: does this work???
+                        irconst = pyvex.IRExpr.Const.__new__(pyvex.IRExpr.Const)    # XXX: does this work???
                         irconst.con = dst
-                        irconst.is_atomic = True
                         irconst.result_type = dst.type
                         irconst.tag = 'Iex_Const'
 

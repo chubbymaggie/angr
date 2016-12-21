@@ -125,7 +125,7 @@ class LiveDefinitions(object):
                 l.warning('add_def: Got a None for a SimRegisterVariable. Consider fixing.')
                 return new_defs_added
 
-            size = min(variable.size / 8, size_threshold)
+            size = min(variable.size, size_threshold)
             offset = variable.reg
             while offset < variable.reg + size:
                 if location not in self._register_map[offset]:
@@ -136,7 +136,7 @@ class LiveDefinitions(object):
             self._defs[variable].add(location)
 
         elif isinstance(variable, SimMemoryVariable):
-            size = min(variable.size / 8, size_threshold)
+            size = min(variable.size, size_threshold)
             offset = variable.addr
             while offset < variable.addr + size:
                 if location not in self._memory_map[offset]:
@@ -184,7 +184,7 @@ class LiveDefinitions(object):
                 l.warning('kill_def: Got a None for a SimRegisterVariable. Consider fixing.')
                 return None
 
-            size = min(variable.size / 8, size_threshold)
+            size = min(variable.size, size_threshold)
             offset = variable.reg
             while offset < variable.reg + size:
                 self._register_map[offset] = { location }
@@ -193,7 +193,7 @@ class LiveDefinitions(object):
             self._defs[variable] = { location }
 
         elif isinstance(variable, SimMemoryVariable):
-            size = min(variable.size / 8, size_threshold)
+            size = min(variable.size, size_threshold)
             offset = variable.addr
             while offset < variable.addr + size:
                 self._memory_map[offset] = { location }
@@ -223,7 +223,7 @@ class LiveDefinitions(object):
                 l.warning('lookup_defs: Got a None for a SimRegisterVariable. Consider fixing.')
                 return live_def_locs
 
-            size = min(variable.size / 8, size_threshold)
+            size = min(variable.size, size_threshold)
             offset = variable.reg
             while offset < variable.reg + size:
                 if offset in self._register_map:
@@ -231,7 +231,7 @@ class LiveDefinitions(object):
                 offset += 1
 
         elif isinstance(variable, SimMemoryVariable):
-            size = min(variable.size / 8, size_threshold)
+            size = min(variable.size, size_threshold)
             offset = variable.addr
             while offset < variable.addr + size:
                 if offset in self._memory_map:
@@ -607,10 +607,10 @@ class DDG(Analysis):
                 data_generated = None
                 last_statement_id = a.stmt_idx
 
-            if a.bbl_addr is None:
-                current_code_location = CodeLocation(None, None, sim_procedure=a.sim_procedure)
-            else:
+            if a.sim_procedure is None:
                 current_code_location = CodeLocation(a.bbl_addr, a.stmt_idx, ins_addr=a.ins_addr)
+            else:
+                current_code_location = CodeLocation(None, None, sim_procedure=a.sim_procedure)
 
             if a.type == "mem":
                 if a.actual_addrs is None:
@@ -697,7 +697,7 @@ class DDG(Analysis):
                 # TODO: Support symbolic register offsets
 
                 reg_offset = a.offset
-                variable = SimRegisterVariable(reg_offset, a.data.ast.size())
+                variable = SimRegisterVariable(reg_offset, a.data.ast.size() / 8)
 
                 if a.action == 'read':
                     # What do we want to do?
@@ -1086,9 +1086,9 @@ class DDG(Analysis):
         # Group all dependencies first
 
         simrun_addr_to_func = { }
-        for _, func in self._cfg.function_manager.functions.iteritems():
+        for _, func in self.kb.functions.iteritems():
             for block in func.blocks:
-                simrun_addr_to_func[block] = func
+                simrun_addr_to_func[block.addr] = func
 
         for src, dst, data in self.graph.edges_iter(data=True):
             src_target_func = None
@@ -1100,5 +1100,115 @@ class DDG(Analysis):
                 dst_target_func = simrun_addr_to_func[dst.simrun_addr]
                 if not dst_target_func is src_target_func:
                     self._function_data_dependencies[dst_target_func].add_edge(src, dst, **data)
+
+
+    def find_definitions(self, variable, simplified_graph=True):
+        """
+        Find all definitions of the given variable.
+
+        :param SimVariable variable:
+        :param bool simplified_graph: True if you just want to search in the simplified graph instead of the normal
+                                      graph. Usually the simplified graph suffices for finding definitions of register
+                                      or memory variables.
+        :return: A collection of all variable definitions to the specific variable.
+        :rtype: list
+        """
+
+        if simplified_graph:
+            graph = self.simplified_data_graph
+        else:
+            graph = self.graph
+
+        defs = []
+
+        for n in graph.nodes_iter():  # type: ProgramVariable
+            if n.variable == variable:
+                defs.append(n)
+
+        return defs
+
+
+    def find_consumers(self, var_def, simplified_graph=True):
+        """
+        Find all consumers to the specified variable definition.
+
+        :param ProgramVariable var_def: The variable definition.
+        :param bool simplified_graph: True if we want to search in the simplified graph, False otherwise.
+        :return: A collection of all consumers to the specified variable definition.
+        :rtype: list
+        """
+
+        if simplified_graph:
+            graph = self.simplified_data_graph
+        else:
+            graph = self.graph
+
+        if var_def not in graph:
+            return []
+
+        consumers = []
+        out_edges = graph.out_edges(var_def, data=True)
+        for _, dst, data in out_edges:
+            if 'type' in data and data['type'] == 'kill':
+                # skip killing edges
+                continue
+            consumers.append(dst)
+
+        return consumers
+
+
+    def find_killers(self, var_def, simplified_graph=True):
+        """
+        Find all killers to the specified variable definition.
+
+        :param ProgramVariable var_def: The variable definition.
+        :param bool simplified_graph: True if we want to search in the simplified graph, False otherwise.
+        :return: A collection of all killers to the specified variable definition.
+        :rtype: list
+        """
+
+        if simplified_graph:
+            graph = self.simplified_data_graph
+        else:
+            graph = self.graph
+
+        if var_def not in graph:
+            return []
+
+        killers = []
+        out_edges = graph.out_edges(var_def, data=True)
+        for _, dst, data in out_edges:
+            if 'type' in data and data['type'] == 'kill':
+                killers.append(dst)
+
+        return killers
+
+
+    def find_sources(self, var_def, simplified_graph=True):
+        """
+        Find all sources to the specified variable definition.
+
+        :param ProgramVariable var_def: The variable definition.
+        :param bool simplified_graph: True if we want to search in the simplified graph, False otherwise.
+        :return: A collection of all sources to the specified variable definition.
+        :rtype: list
+        """
+
+        if simplified_graph:
+            graph = self.simplified_data_graph
+        else:
+            graph = self.graph
+
+        if var_def not in graph:
+            return []
+
+        sources = []
+        in_edges = graph.in_edges(var_def, data=True)
+        for src, _, data in in_edges:
+            if 'type' in data and data['type'] == 'kill':
+                continue
+            sources.append(src)
+
+        return sources
 
 register_analysis(DDG, 'DDG')

@@ -1,16 +1,20 @@
 import networkx
 
+# errors
+from ..errors import AngrForwardAnalysisError
+# notices
+from ..errors import AngrSkipEntryNotice, AngrDelayEntryNotice, AngrJobMergingFailureNotice, \
+    AngrJobWideningFailureNotice
+
 class EntryInfo(object):
     """
     Stores information for each entry
     """
     def __init__(self, key, entry):
         self.key = key
-        self.entries = [ entry ]
+        self.entries = [ (entry, '') ]
 
-        self.merged_entries = [ ]
-        self.widened_entries = [ ]
-        self.narrowing_count = 0
+        self.narrowing_count = 0  # not used
 
     def __hash__(self):
         return hash(self.key)
@@ -31,12 +35,20 @@ class EntryInfo(object):
         :return: The latest available entry.
         """
 
-        if self.widened_entries:
-            return self.widened_entries[-1]
-        elif self.merged_entries:
-            return self.merged_entries[-1]
-        else:
-            return self.entries[-1]
+        ent, _ = self.entries[-1]
+        return ent
+
+    @property
+    def merged_entries(self):
+        for ent, entry_type in self.entries:
+            if entry_type == 'merged':
+                yield ent
+
+    @property
+    def widened_entries(self):
+        for ent, entry_type in self.entries:
+            if entry_type == 'widened':
+                yield ent
 
     def add_entry(self, entry, merged=False, widened=False):
         """
@@ -46,14 +58,12 @@ class EntryInfo(object):
         :param bool widened: Whether it is a widened entry or not.
         """
 
+        entry_type = ''
         if merged:
-            self.merged_entries.append(entry)
-
+            entry_type = 'merged'
         elif widened:
-            self.widened_entries.append(entry)
-
-        else:
-            self.entries.append(entry)
+            entry_type = 'widened'
+        self.entries.append((entry, entry_type))
 
 
 class ForwardAnalysis(object):
@@ -69,17 +79,26 @@ class ForwardAnalysis(object):
     Feel free to discuss with me (Fish) if you have any suggestion or complaint!
     """
 
-    def __init__(self, order_entries=False, allow_merging=False):
+    def __init__(self, order_entries=False, allow_merging=False, allow_widening=False, status_callback=None):
         """
         Constructor
 
         :param bool order_entries: If all entries should be ordered or not.
+        :param bool allow_merging: If entry merging is allowed.
+        :param bool allow_widening: If entry widening is allowed.
         :return: None
         """
 
         self._order_entries = order_entries
 
         self._allow_merging = allow_merging
+        self._allow_widening = allow_widening
+
+        self._status_callback = status_callback
+
+        # sanity checks
+        if self._allow_widening and not self._allow_merging:
+            raise AngrForwardAnalysisError('Merging must be allowed if widening is allowed.')
 
         # Analysis progress control
         self._should_abort = False
@@ -162,6 +181,9 @@ class ForwardAnalysis(object):
     def _merge_entries(self, *entries):
         raise NotImplementedError('_merge_entries() is not implemented.')
 
+    def _should_widen_entries(self, *entries):
+        raise NotImplementedError('_should_widen_entries() is not implemented.')
+
     def _widen_entries(self, *entries):
         raise NotImplementedError('_widen_entries() is not implemented.')
 
@@ -184,9 +206,34 @@ class ForwardAnalysis(object):
         if not self._entries:
             self._entry_list_empty()
 
-        while not self.should_abort and self._entries:
+        while not self.should_abort:
+
+            if self._status_callback is not None:
+                self._status_callback(self)
+
+            # should_abort might be changed by the status callback function
+            if self.should_abort:
+                return
+
+            if not self._entries:
+                self._entry_list_empty()
+
+            if not self._entries:
+                # still no job available
+                break
 
             entry_info = self._entries[0]
+
+            try:
+                self._pre_entry_handling(entry_info.entry)
+            except AngrDelayEntryNotice:
+                # delay the handling of this job
+                continue
+            except AngrSkipEntryNotice:
+                # consume and skip this job
+                self._entries = self._entries[1:]
+                continue
+
             self._entries = self._entries[1:]
 
             self._handle_entry(entry_info)
@@ -196,9 +243,6 @@ class ForwardAnalysis(object):
                 break
 
             self._intra_analysis()
-
-            if not self._entries:
-                self._entry_list_empty()
 
         self._post_analysis()
 
@@ -210,11 +254,6 @@ class ForwardAnalysis(object):
         """
 
         entry = entry_info.entry
-
-        try:
-            self._pre_entry_handling(entry)
-        except AngrSkipEntryNotice:
-            return
 
         successors = self._get_successors(entry)
 
@@ -240,24 +279,47 @@ class ForwardAnalysis(object):
         :return: None
         """
 
-        if self._allow_merging:
-            key = self._entry_key(entry)
+        key = self._entry_key(entry)
 
+        if self._allow_merging:
             if key in self._entries_map:
                 entry_info = self._entries_map[key]
-                try:
-                    merged_entry = self._merge_entries(entry_info.entry, entry)
-                    entry_info.add_entry(merged_entry, merged=True)
-                except AngrJobMergingFailureNotice:
-                    # merging failed
-                    entry_info = EntryInfo(key, entry)
-                    # update the entries map
-                    self._entries_map[key] = entry_info
+
+                # decide if we want to trigger a widening
+                # if not, we'll simply do the merge
+                # TODO: save all previous entries for the sake of widening
+                entry_added = False
+                if self._allow_widening and self._should_widen_entries(entry_info.entry, entry):
+                    try:
+                        widened_entry = self._widen_entries(entry_info.entry, entry)
+                        # remove the old job since now we have a widened one
+                        if entry_info in self._entries:
+                            self._entries.remove(entry_info)
+                        entry_info.add_entry(widened_entry, widened=True)
+                        entry_added = True
+                    except AngrJobWideningFailureNotice:
+                        # widening failed
+                        # fall back to merging...
+                        pass
+
+                if not entry_added:
+                    try:
+                        merged_entry = self._merge_entries(entry_info.entry, entry)
+                        # remove the old job since now we have a merged one
+                        if entry_info in self._entries:
+                            self._entries.remove(entry_info)
+                        entry_info.add_entry(merged_entry, merged=True)
+                    except AngrJobMergingFailureNotice:
+                        # merging failed
+                        entry_info = EntryInfo(key, entry)
+                        # update the entries map
+                        self._entries_map[key] = entry_info
+
             else:
                 entry_info = EntryInfo(key, entry)
                 self._entries_map[key] = entry_info
+
         else:
-            key = self._entry_key(entry)
             entry_info = EntryInfo(key, entry)
 
         if self._order_entries:
@@ -314,5 +376,3 @@ class ForwardAnalysis(object):
                 hi = mid
 
         lst.insert(lo, elem)
-
-from ..errors import AngrSkipEntryNotice, AngrJobMergingFailureNotice

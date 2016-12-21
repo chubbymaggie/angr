@@ -7,7 +7,7 @@ import networkx
 from cle import ELF, PE
 import simuvex
 
-from ..knowledge import Function, HookNode, BlockNode
+from ..knowledge import Function, HookNode, BlockNode, FunctionManager
 from ..analysis import Analysis
 from ..errors import AngrCFGError, AngrTranslationError, AngrMemoryError
 from ..extern_obj import AngrExternObject
@@ -119,6 +119,8 @@ class CFGBase(Analysis):
         """
         self._graph = networkx.DiGraph()
 
+        self.kb.functions = FunctionManager(self.kb)
+
     def _post_analysis(self):
 
         if self._normalize:
@@ -130,6 +132,16 @@ class CFGBase(Analysis):
             for f in self.kb.functions.values():
                 if not self.project.is_hooked(f.addr):
                     f.normalize()
+
+    def make_copy(self, copy_to):
+        """
+        Copy self attributes to the new object.
+
+        :param CFGBase copy_to: The target to copy to.
+        :return: None
+        """
+
+        copy_to._normalized = self._normalized
 
     # pylint: disable=no-self-use
     def copy(self):
@@ -164,7 +176,7 @@ class CFGBase(Analysis):
         :rtype:                             list
         """
 
-        if excluding_fakeret and jumpkind == 'Ijk_Ret':
+        if excluding_fakeret and jumpkind == 'Ijk_FakeRet':
             return [ ]
 
         if not excluding_fakeret and jumpkind is None:
@@ -245,15 +257,16 @@ class CFGBase(Analysis):
     def get_all_successors(self, basic_block):
         return networkx.dfs_successors(self._graph, basic_block)
 
-    def get_node(self, addr_tuple):
+    def get_node(self, node_key):
         """
         Get a single node from node key.
 
-        :param addr_tuple: The node key
-        :return:
+        :param SimRunKey node_key: The node key
+        :return: The CFGNode
+        :rtype: CFGNode.
         """
-        if addr_tuple in self._nodes.keys():
-            return self._nodes[addr_tuple]
+        if node_key in self._nodes:
+            return self._nodes[node_key]
         else:
             return None
 
@@ -413,7 +426,7 @@ class CFGBase(Analysis):
         if not self.graph.has_edge(src_block, dst_block):
             raise AngrCFGError('Edge (%s, %s) does not exist in CFG' % (src_block, dst_block))
 
-        return self.graph[src_block][dst_block]['exit_stmt_idx']
+        return self.graph[src_block][dst_block]['stmt_idx']
 
     @property
     def graph(self):
@@ -1144,6 +1157,11 @@ class CFGBase(Analysis):
             if addr != fn.addr and addr in self.kb.functions and self.kb.functions[addr].is_plt:
                 to_remove.add(fn.addr)
 
+        # remove empty functions
+        for function in self.kb.functions.values():
+            if function.startpoint is None:
+                to_remove.add(function.addr)
+
         for addr in to_remove:
             del self.kb.functions[addr]
 
@@ -1361,7 +1379,7 @@ class CFGBase(Analysis):
         """
 
         stack = list(starts)
-        traversed = set()
+        traversed = set() if traversed_cfg_nodes is None else set(traversed_cfg_nodes)
 
         while stack:
             n = stack[0]  # type: CFGNode
@@ -1430,6 +1448,10 @@ class CFGBase(Analysis):
 
         dst_addr = dst.addr
 
+        # get instruction address and statement index
+        ins_addr = data.get('ins_addr', None)
+        stmt_idx = data.get('stmt_idx', None)
+
         if jumpkind == 'Ijk_Call' or jumpkind.startswith('Ijk_Sys'):
 
             is_syscall = jumpkind.startswith('Ijk_Sys')
@@ -1441,7 +1463,8 @@ class CFGBase(Analysis):
             if n is None: src_node = src_addr
             else: src_node = self._to_snippet(n)
 
-            self.kb.functions._add_call_to(src_function.addr, src_node, dst_addr, None, syscall=is_syscall)
+            self.kb.functions._add_call_to(src_function.addr, src_node, dst_addr, None, syscall=is_syscall,
+                                           ins_addr=ins_addr, stmt_idx=stmt_idx)
 
             if dst_function.returning:
                 returning_target = src.addr + src.size
@@ -1499,7 +1522,9 @@ class CFGBase(Analysis):
                 if dst_addr not in blockaddr_to_function:
                     blockaddr_to_function[dst_addr] = src_function
 
-                self.kb.functions._add_transition_to(src_function.addr, src_node, dst_node)
+                self.kb.functions._add_transition_to(src_function.addr, src_node, dst_node, ins_addr=ins_addr,
+                                                     stmt_idx=stmt_idx
+                                                     )
 
         elif jumpkind == 'Ijk_FakeRet':
 
