@@ -1,23 +1,22 @@
 
-import struct
-from itertools import count
-from collections import defaultdict
+import logging
 import re
 import string
-import logging
+import struct
+from collections import defaultdict
+from itertools import count
 
-import cffi
 import capstone
+import cffi
+import cle
 import networkx
 import pyvex
-import cle
+from . import Analysis, register_analysis
 
-from simuvex import SimMemoryVariable, SimTemporaryVariable
-from ..analysis import Analysis, register_analysis
 from ..knowledge_base import KnowledgeBase
-from ..extern_obj import AngrExternObject
+from ..sim_variable import SimMemoryVariable, SimTemporaryVariable
 
-l = logging.getLogger('angr.analyses.reassembler')
+l = logging.getLogger("angr.analyses.reassembler")
 
 #
 # Exceptions
@@ -319,8 +318,8 @@ class SymbolManager(object):
             return self.addr_to_label[addr][0]
 
         # Check if the address points to a function by checking the plt of main binary
-        reverse_plt = self.project.loader.main_bin.reverse_plt
-        symbols_by_addr = self.project.loader.main_bin.symbols_by_addr
+        reverse_plt = self.project.loader.main_object.reverse_plt
+        symbols_by_addr = self.project.loader.main_object.symbols_by_addr
 
         if addr in reverse_plt:
             # It's a PLT entry!
@@ -1557,8 +1556,8 @@ class Data(object):
                     addr = self.binary.fast_memory_load(self.addr + i * pointer_size, pointer_size, int,
                                                         endness=self.project.arch.memory_endness
                                                         )
-                    obj = self.project.loader.addr_belongs_to_object(addr)
-                    if obj is self.project.loader.main_bin:
+                    obj = self.project.loader.find_object_containing(addr)
+                    if obj is self.project.loader.main_object:
                         # a dynamic pointer
                         if self.binary.main_executable_regions_contain(addr) or \
                                 self.binary.main_nonexecutable_regions_contain(addr):
@@ -1661,11 +1660,11 @@ class Reassembler(Analysis):
 
         self._relocations = [ ]
 
-        self._initialize()
-
         self._inserted_asm_before_label = defaultdict(list)
         self._inserted_asm_after_label = defaultdict(list)
         self._removed_instructions = set()
+
+        self._initialize()
 
     #
     # Overridden predefined methods
@@ -1718,13 +1717,13 @@ class Reassembler(Analysis):
         if self._main_executable_regions is None:
             self._main_executable_regions = []
 
-            obj = self.project.loader.main_bin
+            obj = self.project.loader.main_object
 
             if obj.sections:
                 for sec in obj.sections:
                     if sec.is_executable:
-                        min_addr = sec.min_addr + obj.rebase_addr
-                        max_addr = sec.max_addr + obj.rebase_addr + 1
+                        min_addr = sec.min_addr
+                        max_addr = sec.max_addr + 1
                         if max_addr <= min_addr or min_addr == 0:
                             continue
                         self._main_executable_regions.append((min_addr, max_addr))
@@ -1732,8 +1731,8 @@ class Reassembler(Analysis):
             else:
                 for seg in obj.segments:
                     if seg.is_executable:
-                        min_addr = seg.min_addr + obj.rebase_addr
-                        max_addr = seg.max_addr + obj.rebase_addr + 1
+                        min_addr = seg.min_addr
+                        max_addr = seg.max_addr + 1
                         self._main_executable_regions.append((min_addr, max_addr))
 
         return self._main_executable_regions
@@ -1748,7 +1747,7 @@ class Reassembler(Analysis):
         if self._main_nonexecutable_regions is None:
             self._main_nonexecutable_regions = []
 
-            obj = self.project.loader.main_bin
+            obj = self.project.loader.main_object
 
             if obj.sections:
                 for sec in obj.sections:
@@ -1756,8 +1755,8 @@ class Reassembler(Analysis):
                         # hack for ELF binaries...
                         continue
                     if not sec.is_executable:
-                        min_addr = sec.min_addr + obj.rebase_addr
-                        max_addr = sec.max_addr + obj.rebase_addr + 1
+                        min_addr = sec.min_addr
+                        max_addr = sec.max_addr + 1
                         if max_addr <= min_addr or min_addr == 0:
                             continue
                         self._main_nonexecutable_regions.append((min_addr, max_addr))
@@ -1765,8 +1764,8 @@ class Reassembler(Analysis):
             else:
                 for seg in obj.segments:
                     if not seg.is_executable:
-                        min_addr = seg.min_addr + obj.rebase_addr
-                        max_addr = seg.max_addr + obj.rebase_addr + 1
+                        min_addr = seg.min_addr
+                        max_addr = seg.max_addr + 1
                         self._main_nonexecutable_regions.append((min_addr, max_addr))
 
         return self._main_nonexecutable_regions
@@ -1793,7 +1792,7 @@ class Reassembler(Analysis):
         :return:
         """
         for start, end in self.main_executable_regions:
-            if addr >= start and addr < end:
+            if start <= addr < end:
                 return True
         return False
 
@@ -1834,7 +1833,7 @@ class Reassembler(Analysis):
         :rtype: bool
         """
         for start, end in self.main_nonexecutable_regions:
-            if addr >= start and addr < end:
+            if start <= addr < end:
                 return True
         return False
 
@@ -1863,7 +1862,7 @@ class Reassembler(Analysis):
 
         if closest_region is not None:
             return closest_region
-        return (False, None)
+        return False, None
 
     def register_instruction_reference(self, insn_addr, ref_addr, sort, insn_size):
 
@@ -1912,7 +1911,6 @@ class Reassembler(Analysis):
 
         else:
             raise BinaryError('Unsupported sort "%s" in register_instruction_reference().' % sort)
-
 
         r = Relocation(addr, ref_addr, sort)
 
@@ -2299,27 +2297,24 @@ class Reassembler(Analysis):
         """
 
         # figure out section alignments
-        for section in self.project.loader.main_bin.sections:
-            if isinstance(section, AngrExternObject):
-                continue
-            section_addr = section.vaddr + self.project.loader.main_bin.rebase_addr
+        for section in self.project.loader.main_object.sections:
             in_segment = False
-            for segment in self.project.loader.main_bin.segments:
-                segment_addr = segment.vaddr + self.project.loader.main_bin.rebase_addr
-                if segment_addr <= section_addr < segment_addr + segment.memsize:
+            for segment in self.project.loader.main_object.segments:
+                segment_addr = segment.vaddr
+                if segment_addr <= section.vaddr < segment_addr + segment.memsize:
                     in_segment = True
                     break
             if not in_segment:
                 continue
 
             # calculate alignments
-            if section_addr % 0x20 == 0:
+            if section.vaddr % 0x20 == 0:
                 alignment = 0x20
-            elif section_addr % 0x10 == 0:
+            elif section.vaddr % 0x10 == 0:
                 alignment = 0x10
-            elif section_addr % 0x8 == 0:
+            elif section.vaddr % 0x8 == 0:
                 alignment = 0x8
-            elif section_addr % 0x4 == 0:
+            elif section.vaddr % 0x4 == 0:
                 alignment = 0x4
             else:
                 alignment = 2
@@ -2346,7 +2341,7 @@ class Reassembler(Analysis):
             # switch capstone to AT&T style
             self.project.arch.capstone_x86_syntax = "at&t"
             # clear the block cache in lifter!
-            self.project.factory._lifter.clear_cache()
+            self.project.factory.default_engine.clear_cache()
 
         # initialize symbol manager
         self.symbol_manager = SymbolManager(self, cfg)
@@ -2360,12 +2355,14 @@ class Reassembler(Analysis):
 
         l.debug('Creating functions...')
         for f in cfg.kb.functions.values():
+            # Skip all SimProcedures
             if self.project.is_hooked(f.addr):
-                # Skip all SimProcedures
+                continue
+            elif self.project._simos.is_syscall_addr(f.addr):
                 continue
 
             # Check which section the start address belongs to
-            section = next(iter(sec.name for sec in self.project.loader.main_bin.sections
+            section = next(iter(sec.name for sec in self.project.loader.main_object.sections
                                 if f.addr >= sec.vaddr and f.addr < sec.vaddr + sec.memsize
                                 ),
                            ".text"
@@ -2381,8 +2378,7 @@ class Reassembler(Analysis):
 
         # Data
 
-        has_sections = len(self.project.loader.main_bin.sections) > 0
-        rebase_addr = self.project.loader.main_bin.rebase_addr
+        has_sections = len(self.project.loader.main_object.sections) > 0
 
         l.debug('Creating data entries...')
         for addr, memory_data in cfg._memory_data.iteritems():
@@ -2400,8 +2396,8 @@ class Reassembler(Analysis):
 
             if has_sections:
                 # Check which section the start address belongs to
-                section = next(iter(sec for sec in self.project.loader.main_bin.sections
-                                    if addr >= rebase_addr + sec.vaddr and addr < rebase_addr + sec.vaddr + sec.memsize
+                section = next(iter(sec for sec in self.project.loader.main_object.sections
+                                    if sec.vaddr <= addr < sec.vaddr + sec.memsize
                                     ),
                                None
                                )
@@ -2411,8 +2407,8 @@ class Reassembler(Analysis):
                     self.data.append(data)
                 elif memory_data.sort == 'segment-boundary':
                     # it just points to the end of the segment or a section
-                    section = next(iter(sec for sec in self.project.loader.main_bin.sections
-                                        if addr == rebase_addr + sec.vaddr + sec.memsize),
+                    section = next(iter(sec for sec in self.project.loader.main_object.sections
+                                        if addr == sec.vaddr + sec.memsize),
                                    None
                                    )
                     if section is not None:
@@ -2427,8 +2423,8 @@ class Reassembler(Analysis):
                 # the binary does not have any section
                 # we use segment information instead
                 # TODO: this logic needs reviewing
-                segment = next(iter(seg for seg in self.project.loader.main_bin.segments
-                                    if addr >= rebase_addr + seg.vaddr and addr <= rebase_addr + seg.vaddr + seg.memsize
+                segment = next(iter(seg for seg in self.project.loader.main_object.segments
+                                    if seg.vaddr <= addr <= seg.vaddr + seg.memsize
                                     ),
                                None
                                )
@@ -2450,23 +2446,23 @@ class Reassembler(Analysis):
         all_addrs = all_data_addrs | all_procedure_addrs
 
         if has_sections:
-            for section in self.project.loader.main_bin.sections:
+            for section in self.project.loader.main_object.sections:
 
                 if section.name in section_names_to_ignore:
                     # skip all sections that are CGC specific
                     continue
 
                 # make sure this section is inside a segment
-                for segment in self.project.loader.main_bin.segments:
-                    segment_start = rebase_addr + segment.vaddr
+                for segment in self.project.loader.main_object.segments:
+                    segment_start = segment.vaddr
                     segment_end = segment_start + segment.memsize
-                    if segment_start <= rebase_addr + section.vaddr < segment_end:
+                    if segment_start <= section.vaddr < segment_end:
                         break
                 else:
                     # this section is not mapped into memory
                     continue
 
-                section_boundary_addr = rebase_addr+section.vaddr+section.memsize
+                section_boundary_addr = section.vaddr + section.memsize
                 if section_boundary_addr not in all_addrs:
                     data = Data(self, addr=section_boundary_addr, size=0, sort='segment-boundary',
                                 section_name=section.name
@@ -2523,7 +2519,7 @@ class Reassembler(Analysis):
                 if i + 1 == len(self.data):
                     if data.section is None:
                         continue
-                    data.size = rebase_addr + data.section.vaddr + data.section.memsize - data.addr
+                    data.size = data.section.vaddr + data.section.memsize - data.addr
                 else:
                     data.size = self.data[i + 1].addr - data.addr
 
@@ -2536,7 +2532,7 @@ class Reassembler(Analysis):
         # restore capstone X86 syntax at the end
         if self.project.arch.capstone_x86_syntax != old_capstone_syntax:
             self.project.arch.capstone_x86_syntax = old_capstone_syntax
-            self.project.factory._lifter.clear_cache()
+            self.project.factory.default_engine.clear_cache()
 
         l.debug('Initialized.')
 
@@ -2736,13 +2732,13 @@ class Reassembler(Analysis):
             if candidate_node is None:
                 continue
             base_graph.add_node(candidate_node)
-            tmp_kb = KnowledgeBase(self.project, self.project.loader.main_bin)
+            tmp_kb = KnowledgeBase(self.project, self.project.loader.main_object)
             cfg = self.project.analyses.CFGAccurate(kb=tmp_kb,
                                                     starts=(candidate.irsb_addr,),
                                                     keep_state=True,
                                                     base_graph=base_graph
                                                     )
-            candidate_irsb = cfg.get_any_irsb(candidate.irsb_addr)  # type: simuvex.SimIRSB
+            candidate_irsb = cfg.get_any_irsb(candidate.irsb_addr)  # type: SimIRSB
             ddg = self.project.analyses.DDG(kb=tmp_kb, cfg=cfg)
 
             mem_var_node = None

@@ -1,7 +1,8 @@
 from . import ExplorationTechnique
+from .. import sim_options
 
 import logging
-l = logging.getLogger('angr.exploration_techniques.explorer')
+l = logging.getLogger("angr.exploration_techniques.explorer")
 
 class Explorer(ExplorationTechnique):
     """
@@ -30,6 +31,16 @@ class Explorer(ExplorationTechnique):
         self.num_find = num_find
         self.avoid_priority = avoid_priority
 
+        find_addrs = getattr(self.find, "addrs", None)
+        avoid_addrs = getattr(self.avoid, "addrs", None)
+
+        # it is safe to use unicorn only if all addresses at which we should stop are statically known
+        self._warn_unicorn = (find_addrs is None) or (avoid_addrs is None)
+
+        # even if avoid or find addresses are not statically known, stop on those that we do know
+        self._extra_stop_points = (find_addrs or set()) | (avoid_addrs or set())
+
+
         # TODO: This is a hack for while CFGFast doesn't handle procedure continuations
         from .. import analyses
         if isinstance(cfg, analyses.CFGFast):
@@ -38,22 +49,15 @@ class Explorer(ExplorationTechnique):
             self.cfg = None
 
         if self.cfg is not None:
-            if isinstance(avoid, (int, long)):
-                avoid = (avoid,)
-            elif isinstance(avoid, set):
-                avoid = list(avoid)
-            elif not isinstance(avoid, (list, tuple)):
-                avoid = ()
+            avoid = avoid_addrs or set()
 
-            if isinstance(find, (int, long)):
-                find = (find,)
-            elif isinstance(find, set):
-                find = list(find)
-            elif not isinstance(find, (list, tuple)):
+            # we need the find addresses to be determined statically
+            if find_addrs is None:
                 l.error("You must provide at least one 'find' address as a number, set, list, or tuple if you provide a CFG.")
                 l.error("Usage of the CFG has been disabled for this explorer.")
                 self.cfg = None
                 return
+            find = self.find.addrs
 
             for a in avoid:
                 if cfg.get_any_node(a) is None:
@@ -86,18 +90,26 @@ class Explorer(ExplorationTechnique):
                 return
 
             l.warning("Please be sure that the CFG you have passed in is complete.")
-            l.warning("Providng an incomplete CFG can cause viable paths to be discarded!")
+            l.warning("Providing an incomplete CFG can cause viable paths to be discarded!")
 
-    def setup(self, pg):
-        if not self.find_stash in pg.stashes: pg.stashes[self.find_stash] = []
-        if not self.avoid_stash in pg.stashes: pg.stashes[self.avoid_stash] = []
+    def setup(self, simgr):
+        if not self.find_stash in simgr.stashes: simgr.stashes[self.find_stash] = []
+        if not self.avoid_stash in simgr.stashes: simgr.stashes[self.avoid_stash] = []
 
-    def filter(self, path):
-        rFind = self.find(path)
+    def step(self, simgr, stash, **kwargs):
+        base_extra_stop_points = set(kwargs.get("extra_stop_points") or {})
+        return simgr.step(stash=stash, extra_stop_points=base_extra_stop_points | self._extra_stop_points, **kwargs)
+
+    def filter(self, state):
+        if sim_options.UNICORN in state.options and self._warn_unicorn:
+            self._warn_unicorn = False # show warning only once
+            l.warning("Using unicorn with find or avoid conditions that are a lambda (not a number, set, tuple or list).")
+            l.warning("Unicorn may step over states that match the condition (find or avoid) without stopping.")
+        rFind = self.find(state)
         if rFind:
-            if not path.reachable:
+            if not state.history.reachable:
                 return 'unsat'
-            rAvoid = self.avoid(path)
+            rAvoid = self.avoid(state)
             if rAvoid:
                 # if there is a conflict
                 if self.avoid_priority & ((type(rFind) is not set) | (type(rAvoid) is not set)):
@@ -108,19 +120,19 @@ class Explorer(ExplorationTechnique):
                 # Setting rAvoid to {} simplifies the rest of the code
                 rAvoid = {}
             if type(rFind) is set:
-                while path.addr not in rFind:
-                    if path.addr in rAvoid:
+                while state.addr not in rFind:
+                    if state.addr in rAvoid:
                         return self.avoid_stash
-                    path = path.step(num_inst=1)[0]
-                if self.avoid_priority & (path.addr in rAvoid):
+                    state = self.project.factory.successors(state, num_inst=1).successors[0]
+                if self.avoid_priority & (state.addr in rAvoid):
                     # Only occurs if the intersection of rAvoid and rFind is not empty
                     # Why would anyone want that?
                     return self.avoid_stash
-            return (self.find_stash, path)
-        if self.avoid(path): return self.avoid_stash
-        if self.cfg is not None and self.cfg.get_any_node(path.addr) is not None:
-            if path.addr not in self.ok_blocks: return self.avoid_stash
+            return (self.find_stash, state)
+        if self.avoid(state): return self.avoid_stash
+        if self.cfg is not None and self.cfg.get_any_node(state.addr) is not None:
+            if state.addr not in self.ok_blocks: return self.avoid_stash
         return None
 
-    def complete(self, pg):
-        return len(pg.stashes[self.find_stash]) >= self.num_find
+    def complete(self, simgr):
+        return len(simgr.stashes[self.find_stash]) >= self.num_find

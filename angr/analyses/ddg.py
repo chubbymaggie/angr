@@ -1,16 +1,14 @@
 import logging
-import re
 from collections import defaultdict
 
 import networkx
-
 import pyvex
-from simuvex import SimRegisterVariable, SimMemoryVariable, SimTemporaryVariable, SimConstantVariable, SimStackVariable
-from simuvex import SimSolverModeError, SimUnsatError
+from . import Analysis, register_analysis
 
-from ..errors import AngrDDGError
-from ..analysis import Analysis, register_analysis
 from .code_location import CodeLocation
+from ..errors import SimSolverModeError, SimUnsatError, AngrDDGError
+from ..sim_variable import SimRegisterVariable, SimMemoryVariable, SimTemporaryVariable, SimConstantVariable, \
+    SimStackVariable
 
 l = logging.getLogger("angr.analyses.ddg")
 
@@ -505,14 +503,14 @@ class DDG(Analysis):
 
             successing_nodes = self._cfg.graph.successors(node)
             for state in final_states:
-                if state.scratch.jumpkind == 'Ijk_FakeRet' and len(final_states) > 1:
+                if state.history.jumpkind == 'Ijk_FakeRet' and len(final_states) > 1:
                     # Skip fakerets if there are other control flow transitions available
                     continue
 
                 new_call_depth = call_depth
-                if state.scratch.jumpkind == 'Ijk_Call':
+                if state.history.jumpkind == 'Ijk_Call':
                     new_call_depth += 1
-                elif state.scratch.jumpkind == 'Ijk_Ret':
+                elif state.history.jumpkind == 'Ijk_Ret':
                     new_call_depth -= 1
 
                 if self._call_depth is not None and call_depth > self._call_depth:
@@ -522,7 +520,7 @@ class DDG(Analysis):
                 new_defs = self._track(state, live_defs, node.irsb.statements if node.irsb is not None else None)
 
                 #corresponding_successors = [n for n in successing_nodes if
-                #                            not state.ip.symbolic and n.addr == state.se.any_int(state.ip)]
+                #                            not state.ip.symbolic and n.addr == state.se.eval(state.ip)]
                 #if not corresponding_successors:
                 #    continue
 
@@ -530,8 +528,8 @@ class DDG(Analysis):
 
                 for successing_node in successing_nodes:
 
-                    if (state.scratch.jumpkind == 'Ijk_Call' or state.scratch.jumpkind.startswith('Ijk_Sys')) and \
-                            (state.ip.symbolic or successing_node.addr != state.se.any_int(state.ip)):
+                    if (state.history.jumpkind == 'Ijk_Call' or state.history.jumpkind.startswith('Ijk_Sys')) and \
+                            (state.ip.symbolic or successing_node.addr != state.se.eval(state.ip)):
                         # this might be the block after the call, and we are not tracing into the call
                         # TODO: make definition killing architecture independent and calling convention independent
                         filtered_defs = LiveDefinitions()
@@ -578,7 +576,7 @@ class DDG(Analysis):
         # Make a copy of live_defs
         live_defs = live_defs.copy()
 
-        action_list = list(state.log.actions)
+        action_list = list(state.history.recent_actions)
 
         # Since all temporary variables are local, we simply track them in a local dict
         temp_defs = { }
@@ -597,8 +595,8 @@ class DDG(Analysis):
         data_generated = None
 
         # tracks stack pointer and base pointer
-        #sp = state.se.any_int(state.regs.sp) if not state.regs.sp.symbolic else None
-        #bp = state.se.any_int(state.regs.bp) if not state.regs.bp.symbolic else None
+        #sp = state.se.eval(state.regs.sp) if not state.regs.sp.symbolic else None
+        #bp = state.se.eval(state.regs.bp) if not state.regs.bp.symbolic else None
 
         for a in action_list:
 
@@ -616,7 +614,7 @@ class DDG(Analysis):
                 if a.actual_addrs is None:
                     # For now, mem reads don't necessarily have actual_addrs set properly
                     try:
-                        addr_list = { state.se.any_int(a.addr.ast) }
+                        addr_list = { state.se.eval(a.addr.ast) }
                     except (SimSolverModeError, SimUnsatError, ZeroDivisionError):
                         # FIXME: ZeroDivisionError should have been caught by claripy and simuvex.
                         # FIXME: see claripy issue #75. this is just a temporary workaround.
@@ -633,10 +631,10 @@ class DDG(Analysis):
                         if addr_tmp in temp_register_symbols:
                             # it must be a stack variable
                             sort, offset = temp_register_symbols[addr_tmp]
-                            variable = SimStackVariable(offset, a.data.ast.size() / 8, base=sort, base_addr=addr - offset)
+                            variable = SimStackVariable(offset, a.size.ast / 8, base=sort, base_addr=addr - offset)
 
                     if variable is None:
-                        variable = SimMemoryVariable(addr, a.data.ast.size() / 8)  # TODO: Properly unpack the SAO
+                        variable = SimMemoryVariable(addr, a.size.ast / 8)
 
                     pvs = [ ]
 
@@ -1085,19 +1083,19 @@ class DDG(Analysis):
 
         # Group all dependencies first
 
-        simrun_addr_to_func = { }
+        block_addr_to_func = { }
         for _, func in self.kb.functions.iteritems():
             for block in func.blocks:
-                simrun_addr_to_func[block.addr] = func
+                block_addr_to_func[block.addr] = func
 
         for src, dst, data in self.graph.edges_iter(data=True):
             src_target_func = None
-            if src.simrun_addr in simrun_addr_to_func:
-                src_target_func = simrun_addr_to_func[src.simrun_addr]
+            if src.block_addr in block_addr_to_func:
+                src_target_func = block_addr_to_func[src.block_addr]
                 self._function_data_dependencies[src_target_func].add_edge(src, dst, **data)
 
-            if dst.simrun_addr in simrun_addr_to_func:
-                dst_target_func = simrun_addr_to_func[dst.simrun_addr]
+            if dst.block_addr in block_addr_to_func:
+                dst_target_func = block_addr_to_func[dst.block_addr]
                 if not dst_target_func is src_target_func:
                     self._function_data_dependencies[dst_target_func].add_edge(src, dst, **data)
 

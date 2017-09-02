@@ -11,6 +11,12 @@
 *.nam
 *.til
 *.swp
+*.dll
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
 angr/tests/*.png
 screenlog.0
 angr/tests/screenlog.0
@@ -21,3 +27,4 @@ angr/screenlog.0
 /tags
 MANIFEST
 dist
+.eggs
